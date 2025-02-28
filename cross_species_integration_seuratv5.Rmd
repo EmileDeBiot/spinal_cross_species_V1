@@ -1,0 +1,266 @@
+```{r}
+# Load necessary libraries
+library(Seurat)               
+library(scCustomize)          
+library(biomaRt)
+library(dplyr)
+library(knitr)
+library(roxygen2)
+library(ggplot2)
+library(SeuratData)
+library(SeuratDisk)
+
+# Set seed for reproducibility
+set.seed(1234)
+
+# Increase memory usage
+options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB for global variables in future expressions
+```
+
+```{r}
+# List of CRAN packages
+cran_packages <- c(
+  "Seurat",       # Core package for scRNA-seq analysis
+  "scCustomize",  # Enhances customization of Seurat workflows
+  "SoupX",        # Removes ambient RNA contamination
+  "biomaRt",      # Access BioMart and Ensembl databases
+  "dplyr",        # Data manipulation
+  "knitr",        # Report generation
+  "roxygen2"      # Documentation
+)
+
+# Install missing CRAN packages
+installed_cran <- cran_packages %in% installed.packages()
+if (any(!installed_cran)) {
+  install.packages(cran_packages[!installed_cran])
+}
+
+# Load CRAN packages
+lapply(cran_packages, library, character.only = TRUE)
+
+# Install and load DoubletFinder from GitHub
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+if (!"DoubletFinder" %in% installed.packages()) {
+  remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")
+}
+library(DoubletFinder)
+
+# Set seed for reproducibility
+set.seed(1234)
+
+# Increase memory usage
+options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB for global variables in future expressions
+```
+
+
+```{r}
+mouse_neurons <- readRDS("data/mouse_neurons.rds")
+human_neurons <- readRDS("data/human_neurons.rds")
+```
+
+```{r}	
+#-------------------------------------------------------------------------------
+# 1. Load human-mouse ortholog genes
+#-------------------------------------------------------------------------------
+# Load the CSV file containing one-to-one human-mouse orthologs
+human_mouse_orthologs <- read.csv('one2one_orthologs.csv')  # 17,068 orthologs
+# Columns in the CSV:
+# - `ensembl_gene_id`: Human Ensembl gene ID
+# - `external_gene_name`: Human gene symbol
+# - `mmusculus_homolog_ensembl_gene`: Mouse Ensembl gene ID
+# - `mmusculus_homolog_associated_gene_name`: Mouse gene symbol
+
+#-------------------------------------------------------------------------------
+# 2. Extract mouse neurons gene count matrix
+#-------------------------------------------------------------------------------
+# Retrieve the raw counts matrix of mouse neurons
+neurons_mouse_counts <- GetAssayData(mouse_neurons, layer = "counts")
+
+# Check dimensions of the count matrix
+dim(neurons_mouse_counts)  # 20,749 genes, 18,102 neurons
+```	
+
+```{r}
+#-------------------------------------------------------------------------------
+# 3. Filter count matrix for mouse genes with human orthologs
+#-------------------------------------------------------------------------------
+# Retain only rows (genes) in the count matrix that have a human ortholog
+# Use the `mmusculus_homolog_associated_gene_name` column in the ortholog mapping
+# neurons_mouse_counts <- neurons_mouse_counts[
+#   rownames(neurons_mouse_counts) %in% human_mouse_orthologs$mmusculus_homolog_associated_gene_name, 
+# ]
+
+
+#-------------------------------------------------------------------------------
+# 4. Rename mouse genes to their human orthologs (uppercase gene names)
+#-------------------------------------------------------------------------------
+# Match the row names (gene names) in the count matrix with the
+# `mmusculus_homolog_associated_gene_name` column in the ortholog mapping.
+
+matched.genes <- match(
+  rownames(neurons_mouse_counts),  # Mouse genes in the count matrix
+  human_mouse_orthologs$mmusculus_homolog_associated_gene_name  # Mouse genes in the ortholog mapping
+)
+```
+
+```{r}
+# Extract the corresponding human gene names (external_gene_name)
+replaced_gene_names <- human_mouse_orthologs[matched.genes, "external_gene_name"]
+length(replaced_gene_names[is.na(replaced_gene_names)]) # 6875 -> 13547 matched genes
+```
+
+```{r}
+# Where replaced_gene_names is NA, use the original mouse gene names
+replaced_gene_names[is.na(replaced_gene_names)] <- rownames(neurons_mouse_counts)[is.na(replaced_gene_names)]
+length(replaced_gene_names) # 20749
+```
+
+```{r}
+# Replace the row names in the count matrix with human gene names
+rownames(neurons_mouse_counts) <- replaced_gene_names
+
+# Check the updated row names in the count matrix to confirm that mouse gene names
+# have been replaced by their human ortholog names
+head(rownames(neurons_mouse_counts))
+
+# Check dimensions to ensure no changes in the number of rows or columns
+dim(neurons_mouse_counts)  # 20,749 genes, 18,102 neurons
+```	
+
+```{r}
+#-------------------------------------------------------------------------------
+# 5. Extract human neurons gene count matrix
+#------------------------------------------------------------------------------- 
+# Retrieve the raw counts matrix of human neurons
+neurons_human_counts <- GetAssayData(human_neurons, layer = "counts")
+dim(neurons_human_counts) # 27,443 genes, 18,927 neurons
+
+#-------------------------------------------------------------------------------
+# 6. Identify common genes between mouse and human count matrices
+#-------------------------------------------------------------------------------
+# Find the intersection of genes between mouse and human matrices
+common_genes <- intersect(rownames(neurons_mouse_counts), rownames(neurons_human_counts))
+length(common_genes) # 13547
+```
+
+```{r}	
+# Add all mouse genes that are not present in the human gene matrix to the human data with 0 counts
+missing_mouse_genes <- setdiff(rownames(neurons_mouse_counts), rownames(neurons_human_counts))
+length(missing_mouse_genes) # 7202
+
+# Add all human genes that are not present in the mouse gene matrix to the mouse data with 0 counts
+missing_human_genes <- setdiff(rownames(neurons_human_counts), rownames(neurons_mouse_counts))
+length(missing_human_genes) # 13896
+```
+
+```{r}
+# Add all human genes that are not present in the mouse gene matrix to the mouse data with 0 counts
+# COncatenate missing gens, common genes to build a basis for co-integration
+gene_basis <- c(common_genes, missing_mouse_genes, missing_human_genes)
+length(gene_basis) # 13547 34645
+```
+
+```{r}
+# # Add missing rows to the human dataset 
+neurons_human_counts <- rbind(neurons_human_counts, matrix(0, nrow = length(missing_mouse_genes), ncol = ncol(neurons_human_counts)))
+dim(neurons_human_counts)
+```
+
+```{r}
+# # Update rownames 
+rownames(neurons_human_counts)[(nrow(neurons_human_counts) - length(missing_mouse_genes) + 1):nrow(neurons_human_counts)] <- missing_mouse_genes
+```
+
+```{r}
+# Add missing rows to the mouse dataset
+neurons_mouse_counts <- rbind(neurons_mouse_counts, matrix(0, nrow = length(missing_human_genes), ncol = ncol(neurons_mouse_counts)))
+
+# Update rownames
+rownames(neurons_mouse_counts)[(nrow(neurons_mouse_counts) - length(missing_human_genes) + 1):nrow(neurons_mouse_counts)] <- missing_human_genes
+```
+
+```{r}
+# neurons_mouse_counts <- neurons_mouse_counts[rownames(neurons_mouse_counts) %in% gene_basis, ]
+# neurons_human_counts <- neurons_human_counts[rownames(neurons_human_counts) %in% gene_basis, ] 
+```
+
+```{r}
+# Merge mouse and human datasets
+mouse_neurons = CreateSeuratObject(counts = neurons_mouse_counts)
+human_neurons = CreateSeuratObject(counts = neurons_human_counts)
+mouse_neurons$species <- "mouse"
+human_neurons$species <- "human"
+```
+
+```{r}	
+cross_species <- merge(mouse_neurons, human_neurons)
+```
+
+```{r}	
+cross_species <- subset(x = cross_species, subset = orig.ident %in% c("KNAF11", "KNAF10", "KNAF9", "KNAF8", "KNAF3", "KNAF4"))
+```
+
+```{r}
+cross_species[['RNA']] <- JoinLayers(object = cross_species[['RNA']])
+```
+
+```{r}
+cross_species <- split(cross_species, f = cross_species$orig.ident)
+```
+
+```{r}
+cross_species <- NormalizeData(cross_species)
+cross_species <- FindVariableFeatures(cross_species)
+cross_species <- ScaleData(cross_species)
+cross_species <- RunPCA(cross_species)
+```
+
+```{r}
+cross_species <- IntegrateLayers(object = cross_species, method = 'RPCAIntegration', orig.reduction = 'pca', new.reduction = 'rpca', verbose = TRUE, k.weight = 80)
+```
+
+```{r}
+cross_species <- FindNeighbors(cross_species, reduction = 'rpca', dims = 1:30)
+cross_species <- FindClusters(cross_species, resolution = 2, cluster_names = 'rpca_clusters')
+
+# Plot the integrated UMAP
+cross_species <- RunUMAP(cross_species, reduction = 'rpca', dims = 1:30, reduction.name = 'umap.rpca')
+```
+
+```{r}  
+DimPlot(cross_species, reduction = 'umap.rpca',group.by = "orig.ident", title = 'Cross-species rpca integration UMAP')
+```
+
+```{r}	
+# Join layers
+cross_species <- JoinLayers(object = cross_species)
+```
+
+```{r}
+## Downgrade to not v5 object to solve SaveH5Seurat error
+cross_species[["RNA3"]] <- as(object = cross_species[["RNA"]], Class = "Assay")
+DefaultAssay(cross_species) <- "RNA3"
+cross_species[["RNA"]] <- NULL
+cross_species[["RNA"]] <- cross_species[["RNA3"]]
+DefaultAssay(cross_species) <- "RNA"
+cross_species[["RNA3"]] <- NULL
+```
+
+```{r}
+# Add annotation of V1 neurons
+cross_species$training_labels <- -1
+cross_species$training_labels[cross_species$orig.ident == "KNAF4"] <- 1
+cross_species$training_labels[cross_species$orig.ident == "KNAF3"] <- 0
+```
+
+```{r}
+# Save the integrated dataset as h5
+SaveH5Seurat(cross_species, filename = "cross_species_rpca_v5_knafonly.h5Seurat", overwrite = TRUE)
+
+```	
+
+```{r}
+Convert(source = "cross_species_rpca_v5_knafonly.h5Seurat", dest = "cross_species_rpca_v5_knafonly.h5ad", overwrite = TRUE)
+```	

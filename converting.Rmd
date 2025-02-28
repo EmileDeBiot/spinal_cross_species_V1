@@ -1,0 +1,89 @@
+```{r}
+# Load necessary libraries
+library(Seurat)               
+library(scCustomize)          
+library(biomaRt)
+library(dplyr)
+library(knitr)
+library(roxygen2)
+library(ggplot2)
+library(SeuratData)
+library(SeuratDisk)
+
+# Set seed for reproducibility
+set.seed(1234)
+
+# Increase memory usage
+options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB for global variables in future expressions
+```
+
+```{r}
+# List of CRAN packages
+cran_packages <- c(
+  "Seurat",       # Core package for scRNA-seq analysis
+  "scCustomize",  # Enhances customization of Seurat workflows
+  "SoupX",        # Removes ambient RNA contamination
+  "biomaRt",      # Access BioMart and Ensembl databases
+  "dplyr",        # Data manipulation
+  "knitr",        # Report generation
+  "roxygen2"      # Documentation
+)
+
+# Install missing CRAN packages
+installed_cran <- cran_packages %in% installed.packages()
+if (any(!installed_cran)) {
+  install.packages(cran_packages[!installed_cran])
+}
+
+# Load CRAN packages
+lapply(cran_packages, library, character.only = TRUE)
+
+# Install and load DoubletFinder from GitHub
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+if (!"DoubletFinder" %in% installed.packages()) {
+  remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")
+}
+library(DoubletFinder)
+
+# Set seed for reproducibility
+set.seed(1234)
+
+# Increase memory usage
+options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB for global variables in future expressions
+```
+
+```{r}
+data <- readRDS("data/human_neurons.rds")
+```
+
+```{r}
+DefaultAssay(data) = 'RNA'
+```
+
+```{r}
+seu = DietSeurat(
+  data,
+  counts = TRUE, # so, raw counts save to adata.layers['counts']
+  data = TRUE, # so, log1p counts save to adata.X when scale.data = False, else adata.layers['data']
+  scale.data = FALSE, # set to false
+  features = rownames(data), # export all genes, not just top highly variable genes
+  assays = "RNA",
+  dimreducs = c("pca","umap"),
+  graphs = c("RNA_nn", "RNA_snn"), # to RNA_nn -> distances, RNA_snn -> connectivities
+  misc = TRUE
+)
+```
+
+```{r}
+library(MuDataSeurat)
+```
+```{r}
+# for seurat v5, need to JoinLayer first
+DefaultAssay(seu) = "RNA"
+seu <- JoinLayers(seu)
+# single modality
+MuDataSeurat::WriteH5AD(seu, "human_neurons_counts.h5ad", assay="RNA")
+```
+

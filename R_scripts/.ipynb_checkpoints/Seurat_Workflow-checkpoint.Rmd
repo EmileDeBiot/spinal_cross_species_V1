@@ -1,0 +1,2903 @@
+---
+title: "Seurat workflow for single-cell RNA-seq data analysis"
+author: "Souad Youjil Abadi"
+date: "2024-03-15"
+output: html_document
+---
+
+# Seurat Workflow : 
+## Preprocessing : 
+- QC and filtering.
+- Doublet detection.
+## Processing :
+- Data normalization.
+- Identification of highly variable features.
+- Data scaling.
+- Dimensionality reduction.
+- Check unwanted variation (effects of cell cycle, mitochondrial expression, ...).
+- Regress out those variations if needed.
+## Clustering without and with integration :
+- Find the optimal number of PCs.
+- Clustering.
+- Find the optimal resolution.
+- Integration.
+## Find marker genes & cell type annotation
+## Subclustering
+
+```{r setup, include=FALSE}
+# Set global options for all chunks.
+knitr::opts_chunk$set(
+  echo = TRUE, # TRUE to display the code in the final html output document.
+  warning = FALSE, # FALSE to not display warnings in the html output document.
+  message = FALSE) # FALSE to not display messages in the html output document.
+```
+ 
+## 0. Install and load the required packages.
+```{r} 
+# Ensure 'pak' package is installed and loaded.
+if (!requireNamespace("pak", quietly = TRUE)) {
+  install.packages("pak")
+  library(pak)
+  cat("'pak' package successfully installed and loaded.\n")
+} else {
+  library(pak)
+  cat("'pak' package successfully loaded.\n")
+}
+
+# Use 'pak' to install 'Seurat' if not at the desired version & other packages that are required for the analysis. NB: pak automatically handles the logic of checking if the package (and the specific version) is already installed.
+
+pak::pkg_install("Seurat") # Single-cell RNA-seq data analysis.
+pak::pkg_install("scCustomize") # Seurat objects customization.
+pak::pkg_install("tidyverse") # Data visualization.
+pak::pkg_install("patchwork") # Plots combination.
+pak::pkg_install("chris-mcginnis-ucsf/DoubletFinder") # Doublet detection.
+pak::pkg_install("AnnotationHub") 
+pak::pkg_install("ensembldb") # Ensembl database.
+pak::pkg_install("clustree") # Clustering resolution.
+pak::pkg_install("harmony") # Integration.
+pak::pkg_install("ComplexHeatmap") 
+
+library(Seurat)
+library(scCustomize)
+library(tidyverse)
+library(patchwork)
+library(DoubletFinder)
+library(AnnotationHub)
+library(ensembldb)
+library(clustree)
+library(harmony)
+library(ComplexHeatmap)
+library(parallel)
+library(knitr)
+```
+
+```{r}
+# Ensure the required packages are installed and loaded.
+required_packages <- c("Seurat", "scCustomize", "tidyverse", "patchwork", 
+                       "AnnotationHub", "ensembldb", "clustree", "harmony", 
+                       "ComplexHeatmap", "parallel", "knitr")
+
+# Install CRAN packages if they are not already installed
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+  }
+  library(pkg, character.only = TRUE)
+}
+
+# Install DoubletFinder from GitHub
+if (!requireNamespace("DoubletFinder", quietly = TRUE)) {
+  if (!requireNamespace("devtools", quietly = TRUE)) {
+    install.packages("devtools")
+  }
+  devtools::install_github("chris-mcginnis-ucsf/DoubletFinder")
+  library(DoubletFinder)
+}
+
+# Confirm all packages are loaded
+cat("All required packages successfully installed and loaded.\n")
+
+```
+
+## 1. Load the 10X Genomics scRNA-seq data and create Seurat objects.
+```{r}
+# Set the base path for the samples directories.
+base_path <- file.path(getwd(), "..", "results", "mouse")
+
+# List the author directories (Bouvier, Kathe, Knafo, Matson, and Trevisan)
+author_dirs <- list.dirs(base_path, recursive = FALSE)
+
+# Initialize lists to store Seurat objects for filtered and unfiltered samples.
+samples.filtered <- list()
+samples.unfiltered <- list()
+
+# Loop through each author directory.
+for (author_dir in author_dirs) {
+  # List the sample folders within each author directory (no recursion)
+  sample_folders <- list.files(author_dir, full.names = TRUE) 
+  
+  for (sample_dir in sample_folders) {
+    # Define the path to the filtered_feature_bc_matrix directory
+    filtered_path <- file.path(sample_dir, "filtered_feature_bc_matrix")
+    
+    # Check if the filtered_feature_bc_matrix directory exists
+    if (dir.exists(filtered_path)) {
+      # Read the counts data from the filtered_feature_bc_matrix directory.
+      sample_counts <- Read10X(data.dir = filtered_path)
+      # Extract the name of the sample from the sample directory
+      sample_name <- basename(sample_dir)
+      # Create the filtered Seurat object.
+      object_filtered <- CreateSeuratObject(
+        counts = sample_counts, 
+        project = sample_name, 
+        min.cells = 3, 
+        min.features = 200 
+      )
+      # Store the filtered Seurat object with sample_name.
+      samples.filtered[[sample_name]] <- object_filtered
+      # Create the unfiltered Seurat object.
+      object_unfiltered <- CreateSeuratObject(counts = sample_counts, project = sample_name)
+      # Store the unfiltered Seurat object with sample_name.
+      samples.unfiltered[[sample_name]] <- object_unfiltered
+    }
+  }
+}
+
+# Print the list of unfiltered samples.
+print(samples.unfiltered)
+```
+
+- min.cells: Filters out genes that are detected in very few cells, which might be noise or result from experimental errors.
+- min.features: Removes dead cells, empty droplets, or cells with very low gene counts (number of unique genes), which are likely to represent low-quality data.
+
+## 1.bis. Load the 10X Genomics scRNA-seq and Antibody Tag CITE-seq data and merge all samples into a single Seurat object.
+```{r}
+# Set the base path for the sample directory.
+base_path <- file.path(getwd(), "..", "results", "mouse", "Knafo", "citeseq")
+
+# Input the sample name.
+sample_name <- list.files(base_path)
+
+# Import and read the features, barcodes and filtered matrix.
+sample_counts <- Read10X(data.dir = file.path(base_path, sample_name, "filtered_feature_bc_matrix"))
+
+# Extract the RNA and Antibody matrices.
+counts_rna = sample_counts$`Gene Expression` # RNA UMI matrix
+counts_antibody = sample_counts$`Antibody Capture` # Antibody-Derived Tag (ADT) UMI matrix
+
+# Check if the two matrices have identical barcodes (column names). Since measurements were made in the same cells, the barcodes should be the same.
+all.equal(colnames(counts_rna), colnames(counts_antibody))
+```
+
+```{r}
+# Create a Seurat object for the RNA counts and add the antibody counts as a second assay.
+En1Sun1GFPNeuN_filtered <- CreateSeuratObject(counts = counts_rna, project = sample_name,
+                                 min.cells = 3, # A gene must be present in at least 3 cells to be included.
+                                 min.features = 200) # Each cell must have at least 200 genes detected.
+En1Sun1GFPNeuN_unfiltered <- CreateSeuratObject(counts = counts_rna, project = sample_name)
+
+# Create a new assay to store the antibody counts for the filtered and unfiltered Seurat objects.
+ab_assay <- CreateAssayObject(counts = counts_antibody)
+En1Sun1GFPNeuN_filtered[["antibody_counts"]] <- ab_assay
+En1Sun1GFPNeuN_unfiltered[["antibody_counts"]] <- ab_assay
+
+print(En1Sun1GFPNeuN_filtered)
+print(En1Sun1GFPNeuN_unfiltered)
+```
+
+```{r}
+# Merge all the Seurat objects into a single Seurat object.
+# First, add the En1Sun1GFPNeuN_filtered and En1Sun1GFPNeuN_unfiltered Seurat objects to the corresponding lists.
+samples.unfiltered <- c(samples.unfiltered, Knaf4_En1Sun1GFPNeuN_CITEseq = En1Sun1GFPNeuN_unfiltered)
+samples.filtered <- c(samples.filtered, Knaf4_En1Sun1GFPNeuN_CITEseq = En1Sun1GFPNeuN_filtered)
+
+# Place the Knafo samples at the end of the list.
+# Identify indices of Knafo samples.
+knaf_indices <- grep("Knaf", names(samples.unfiltered))
+samples.unfiltered <- c(samples.unfiltered[-knaf_indices], samples.unfiltered[knaf_indices]) 
+samples.filtered <- c(samples.filtered[-knaf_indices], samples.filtered[knaf_indices])
+samples_names <- names(samples.unfiltered)
+samples_names
+
+sc2atlas.filtered <- Merge_Seurat_List(samples.filtered, add.cell.ids = samples_names, project = "sc2atlas.filtered")
+sc2atlas.unfiltered <- Merge_Seurat_List(samples.unfiltered, add.cell.ids = samples_names, project = "sc2atlas.unfiltered")
+
+print(sc2atlas.unfiltered)
+#view(sc2atlas.unfiltered)
+print(sc2atlas.filtered)
+```
+
+## 2. Remove low quality data and visualize QC metrics as a violin plot.
+### 2.1. Percentage of mitochondrial genes expression per cell.
+```{r}
+# Initialize an empty list to store the plots and a variable for the maximum y-value.
+plot_list <- list()
+max_y_limit <- 0
+
+# Calculate the percentage of mitochondrial gene expression per cell and store it in a new column in the metadata.
+sc2atlas.filtered[["percent_mito"]] <- PercentageFeatureSet(sc2atlas.filtered, pattern = "^mt-")     
+
+# Find the maximum percentage of mitochondrial gene expression across all samples.
+max_y_value <- max(sc2atlas.filtered@meta.data$`percent_mito`)
+max_y_limit <- max(max_y_limit, max_y_value)
+
+# Plot the distribution of the percentage of mitochondrial genes expression across samples.
+plot_list$Merged <- VlnPlot(sc2atlas.filtered, features = "percent_mito") +
+  ggtitle("Percentage of mitochondrial RNA transcripts per cell") +
+  xlab("Samples") +
+  ylab("Percentage of mitochondrial genes expression") +
+  scale_y_continuous(limits = c(0, max_y_limit)) + # Set the same y-axis limits for the plot.
+  stat_summary(fun = median, geom = "point", size = 1, color = "white") + # Customize the median dot here.
+  theme_gray() +
+  theme(plot.title = element_text(hjust = 0.5),    # Adjust the plot title position.
+        axis.text.x = element_text(face = "bold", angle = 45, hjust = 1, vjust = 1), # Bold the x-axis labels.
+        axis.text.y = element_text(face = "bold")) # Bold the y-axis labels.
+
+# Combine all plots into a single plot.
+combined_plot <- wrap_plots(plotlist = plot_list)
+print(combined_plot)
+
+# Save the plot as a PNG file.
+plot_filename <- paste0("../sc2atlas_mouse", "/mitochondrial_genes_percentage_plot.png")
+ggsave(plot_filename, combined_plot, width = 16, height = 10)
+```
+
+### 2.2. Number of genes per cell.
+```{r}
+# Plot the distribution of the number of unique genes detected per cell.
+plot_list <- list()
+max_y_limit_genes <- 0
+max_y_value <- max(sc2atlas.filtered@meta.data$nFeature_RNA)
+max_y_limit_genes <- max(max_y_limit_genes, max_y_value)
+
+plot_list$Merged <- VlnPlot(sc2atlas.filtered, features = "nFeature_RNA") +
+  ggtitle("Number of genes detected per cell") +
+  xlab("Sample") +
+  ylab("Number of genes") +
+  scale_y_continuous(limits = c(0, max_y_limit_genes)) + 
+  stat_summary(fun = median, geom = "point", size = 1, color = "white") +
+  theme_gray() +
+  theme(plot.title = element_text(hjust = 0.5),    
+        axis.text.x = element_text(face = "bold", angle = 45, hjust = 1, vjust = 1), 
+        axis.text.y = element_text(face = "bold")) 
+
+combined_plot <- wrap_plots(plotlist = plot_list)
+print(combined_plot)
+
+plot_filename <- paste0("../sc2atlas_mouse", "/nb_genes_plot.png")
+ggsave(plot_filename, combined_plot, width = 16, height = 10)
+```
+### 2.3. Expression level of genes (UMI counts) per cell.
+```{r}
+# Plot the distribution of the total number of UMI counts (number of transcripts detected) per cell.
+plot_list <- list()
+max_y_limit_counts <- 0
+max_y_value <- max(sc2atlas.filtered@meta.data$nCount_RNA)
+max_y_limit_counts <- max(max_y_limit_counts, max_y_value)
+
+plot_list$Merged <- VlnPlot(sc2atlas.filtered, features = "nCount_RNA") +
+  ggtitle("Number of RNA transcripts detected per cell") +
+  xlab("Sample") +
+  ylab("Number of UMI counts") +
+  scale_y_continuous(limits = c(0, max_y_limit_counts)) + 
+  stat_summary(fun = median, geom = "point", size = 1, color = "white") + 
+  theme_gray() +
+  theme(plot.title = element_text(hjust = 0.3),   
+        axis.text.x = element_text(face = "bold", angle = 45, hjust = 1, vjust = 1),
+        axis.text.y = element_text(face = "bold")) 
+
+combined_plot <- wrap_plots(plotlist = plot_list)
+print(combined_plot)
+
+plot_filename <- paste0("../sc2atlas_mouse", "/nb_transcripts_plot.png")
+ggsave(plot_filename, combined_plot, width = 16, height = 10)
+```
+
+```{r}
+# Set the cutoffs in the unfiltered data.
+sc2atlas.unfiltered[["percent_mito"]] <- PercentageFeatureSet(sc2atlas.unfiltered, pattern = "^mt-") 
+p1 <- QC_Plots_Combined_Vln(seurat_object = sc2atlas.unfiltered, mito_name = "percent_mito", feature_cutoffs = 200, mito_cutoffs = 10, UMI_cutoffs = 350, pt.size = 0, plot_median = TRUE, median_size = 5) 
+print(p1)
+plot_filename <- paste0("../sc2atlas_mouse", "/VP_pre_filtering.png")
+ggsave(plot_filename, p1, width = 16, height = 10)
+# Change y scale.
+p2 <- QC_Plots_Combined_Vln(seurat_object = sc2atlas.unfiltered, mito_name = "percent_mito", feature_cutoffs = 200, mito_cutoffs = 10, UMI_cutoffs = 350, pt.size = 0, y_axis_log = TRUE, plot_boxplot = TRUE)
+print(p2)
+plot_filename <- paste0("../sc2atlas_mouse", "/VP_pre_filtering_yscale.png")
+ggsave(plot_filename, p2, width = 16, height = 10)
+```
+
+### 2.4. Scatterplot of genes vs. transcripts & of genes vs. % of mitochondrial genes expression.
+```{r}
+# Number of genes vs. number of transcripts detected per cell.
+p1 <- QC_Plot_UMIvsGene(sc2atlas.unfiltered, low_cutoff_gene = 200)
+# Number of genes vs. % of mitochondrial genes expression detected per cell.
+p2 <- QC_Plot_GenevsFeature(sc2atlas.unfiltered, feature1 = "percent_mito", x_axis_label = "% mitochodrial genes per Cell/Nucleus", low_cutoff_gene = 200, high_cutoff_feature = 10)
+
+# Color data by continuous meta data variable (e.g., % mito genes)
+p3 <- QC_Plot_UMIvsGene(sc2atlas.unfiltered, meta_gradient_name = "percent_mito", low_cutoff_gene = 200)
+# Set a cutoff for the meta data variable
+p4 <- QC_Plot_UMIvsGene(sc2atlas.unfiltered, meta_gradient_name = "percent_mito", low_cutoff_gene = 200, meta_gradient_low_cutoff = 10)
+
+# Combine the plots.
+combined_plot <- wrap_plots(wrap_plots(p1, p2), wrap_plots(p3, p4), nrow = 2)
+print(combined_plot)
+
+plot_filename <- paste0("../sc2atlas_mouse", "/cutoffs_plot.png")
+ggsave(plot_filename, combined_plot, width = 16, height = 10)
+```
+
+```{r}
+# Remove low quality data and visualize QC metrics as a violin plot.
+sc2atlas.filtered <- subset(sc2atlas.filtered, subset = nFeature_RNA > 200 & percent_mito < 10)
+plot <- QC_Plots_Combined_Vln(sc2atlas.filtered, mito_name = "percent_mito", pt.size = 0, plot_median = TRUE, median_size = 5) 
+print(plot)
+
+plot_filename <- paste0("../sc2atlas_mouse", "/VP_post_filtering.png")
+ggsave(plot_filename, plot, width = 16, height = 10)
+```
+
+```{r}
+# Calculate the number of cells filtered out for each sample.
+metadata_unfiltered <- as.data.frame(sc2atlas.unfiltered@meta.data)
+# Group by 'orig.ident' which contains sample names and summarize.
+sample_summary_unfiltered <- metadata_unfiltered %>%
+  group_by(orig.ident) %>%
+  summarise(
+    Unfiltered_dataset = n()
+  )
+metadata_filtered <- as.data.frame(sc2atlas.filtered@meta.data)
+sample_summary_filtered <- metadata_filtered %>%
+  group_by(orig.ident) %>%
+  summarise(
+    Filtered_dataset = n()
+  )
+# Merge the two summaries by 'orig.ident' to align them side by side.
+comparison <- merge(sample_summary_unfiltered, sample_summary_filtered, by = "orig.ident", suffixes = c("_unfiltered", "_filtered"))
+# Calculate the difference.
+differences <- comparison %>%
+  mutate(
+    Number_of_cells_filtered_out = Unfiltered_dataset - Filtered_dataset
+  )
+
+print(sc2atlas.filtered)
+print(differences)
+
+# Save the dataset as a CSV file
+write.csv(differences, file = "../sc2atlas_mouse/cells_counts_postQC.csv", row.names = FALSE)
+```
+
+```{r}
+# Save filtered samples as an RData file
+# Create the directory one level up if it doesn't exist
+if (!dir.exists("../Rdata")) {
+  dir.create("../Rdata")
+}
+
+# Save filtered samples as an RData file in the newly created directory
+save(samples.filtered, file = "../Rdata/samples_filtered_QC.RData")
+```
+
+```{r}
+# Load the saved RData file
+load("../Rdata/samples_filtered_QC.RData")
+```
+
+```{r}
+# Knafo samples
+# Filter samples that contain "BOUV" or "Knaf" in their names
+Knafo <- samples.filtered[grepl("BOUV|Knaf", names(samples.filtered))]
+# Filter samples that contain "Matson", "Kathe", or "Trevisan" in their names
+mat_kat_tre <- samples.filtered[grepl("Matson|Kathe|Trevisan", names(samples.filtered))]
+
+# Rename the variable
+samples.filtered_allsamples <- samples.filtered
+samples.filtered <- Knafo
+```
+
+## 2.5. Doublet detection.
+We will perform one more QC step to remove potential doublets from the data. This step, as all the QC steps, needs to be performed before the integration of the data.
+```{r}
+table(sc2atlas.unfiltered$orig.ident)
+# Check multiplet rate (%) based on the number of cells recovered:
+# https://kb.10xgenomics.com/hc/en-us/articles/360001378811-What-is-the-maximum-number-of-cells-that-can-be-profiled
+# https://kb.10xgenomics.com/hc/en-us/articles/360054599512-What-is-the-cell-multiplet-rate-when-using-the-3-CellPlex-Kit-for-Cell-Multiplexing 
+```
+Multiplet rate of : 
+0.8% for around 1000 cells recovered : Knaf1_En1Sun1GFPNeuN
+1.6% for around 2000 cells recovered : Knaf4_En1Sun1GFPNeuN_CITEseq
+2.4% for around 3000 cells recovered : Kathe & Matson & Knaf2_En1Sun1GFPNeuN
+3.2% for around 4000 cells recovered : Knaf3_En1Sun1NeuN
+4.0% for around 5000 cells recovered : Trevisan_GSM8480597
+5.6% for around 7000 cells recovered : BOUV5_M1_SC1_280421
+16% for around 20000 cells recovered : Trevisan_GSM8480598
+
+```{r}
+# For multiple samples (different cell captures), it is preferable to look for doublets separately for each sample.
+# Define a function to apply the Seurat theme to the plots.
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+
+obj.list <- samples.filtered
+for (i in 1:length(obj.list)) {
+  # 2.5.0. Standard Seurat workflow.
+  obj.list[[i]] <- NormalizeData(obj.list[[i]], normalization.method = "LogNormalize", scale.factor = 10000, assay = "RNA")
+  obj.list[[i]] <- FindVariableFeatures(obj.list[[i]], selection.method = "vst", features = 10000) #10k from around 20k genes.
+  obj.list[[i]] <- ScaleData(obj.list[[i]], features = rownames(obj.list[[i]]))
+  obj.list[[i]] <- RunPCA(obj.list[[i]], nfeatures.print = 5)
+
+  # Find significant PCs.
+  stdv <- obj.list[[i]][["pca"]]@stdev
+  sum.stdv <- sum(obj.list[[i]][["pca"]]@stdev)
+  percent.stdv <- (stdv/sum.stdv) * 100
+  cumulative <- cumsum(percent.stdv)
+  col1 <- which(cumulative > 90 & percent.stdv < 5)[1]
+  col2 <- sort(which((percent.stdv[1:length(percent.stdv) - 1] - percent.stdv[2:length(percent.stdv)]) > 0.05), decreasing = T)[1] + 1
+  min.pc <- min(col1, col2)
+
+  # Finish standard Seurat workflow.
+  obj.list[[i]] <- FindNeighbors(obj.list[[i]], reduction = "pca", dims = 1:min.pc)
+  obj.list[[i]] <- FindClusters(obj.list[[i]], resolution = 1)
+  obj.list[[i]] <- RunUMAP(obj.list[[i]], reduction = "pca", dims = 1:min.pc)
+  
+  # 2.5.1. pK identification (no ground-truth).
+  sweep.list <- paramSweep(obj.list[[i]], PCs = 1:min.pc)
+  sweep.stats <- summarizeSweep(sweep.list)
+  bcmvn <- find.pK(sweep.stats)
+  p0 <- ggplot(bcmvn, aes(pK, BCmetric, group = 1)) + geom_point() + geom_line() + ggtitle(paste("pK identification -", names(obj.list)[i]))
+  print(p0)
+  plot_filename <- paste0("../sc2atlas_mouse", "/pK_identification_", names(obj.list)[i], ".png")
+  ggsave(plot_filename, p0, width = 16, height = 10)
+  
+  # Optimal pK is the max of the bomodality coefficent (BCmvn) distribution.
+  bcmvn.max <- bcmvn[which.max(bcmvn$BCmetric),]
+  optimal.pk <- bcmvn.max$pK
+  optimal.pk <- as.numeric(levels(optimal.pk))[optimal.pk]
+  
+  # 2.5.2. Homotypic doublet proportion estimate.
+  annotations <- obj.list[[i]]@meta.data$seurat_clusters
+  homotypic.prop <- modelHomotypic(annotations)
+  
+  # Assign different multiplet rates based on the number of cells recovered for each sample names.
+  if (names(obj.list)[i] == "Knaf1_En1Sun1GFPNeuN") {
+    nExp.poi <- round(0.008 * nrow(obj.list[[i]]@meta.data))
+  } else if (names(obj.list)[i] == "Knaf4_En1Sun1GFPNeuN_CITEseq") {
+    nExp.poi <- round(0.016 * nrow(obj.list[[i]]@meta.data))
+  } else if (names(obj.list)[i] == "Knaf3_En1Sun1NeuN") {
+    nExp.poi <- round(0.032 * nrow(obj.list[[i]]@meta.data))
+  } else if (names(obj.list)[i] == "Trevisan_GSM8480598") { 
+    nExp.poi <- round(0.160 * nrow(obj.list[[i]]@meta.data))  # 16% for around 20k cells
+  } else if (names(obj.list)[i] == "Trevisan_GSM8480597") {
+    nExp.poi <- round(0.040 * nrow(obj.list[[i]]@meta.data))  # 4.0% for around 5k cells
+  } else if (names(obj.list)[i] == "BOUV5_M1_SC1_280421") {
+    nExp.poi <- round(0.056 * nrow(obj.list[[i]]@meta.data))
+  } else {
+    nExp.poi <- round(0.024 * nrow(obj.list[[i]]@meta.data)) # Default for Kathe & Matson & Knaf2
+  }
+
+  nExp.poi.adj <- round(nExp.poi * (1 - homotypic.prop))
+  obj.list[[i]] <- doubletFinder(obj.list[[i]], 
+                                 PCs = 1:min.pc, 
+                                 pN = 0.25, # default parameter.
+                                 pK = optimal.pk, 
+                                 nExp = nExp.poi.adj)
+  colnames(obj.list[[i]]@meta.data)[7] <- "doublet_finder"
+  
+  # Visualize the doublets.
+  p1 <- apply_theme(DimPlot(obj.list[[i]], reduction = "umap", group.by = "doublet_finder"), paste("Sample :", names(obj.list)[i]))
+  p2 <- apply_theme(DimPlot(obj.list[[i]], reduction = "umap", group.by = "doublet_finder", split.by = "doublet_finder"), paste("Sample :", names(obj.list)[i]))
+  combined_plot <- p1 + p2
+  print(combined_plot)
+  plot_filename <- paste0("../sc2atlas_mouse", "/doublet_detection_plot_", names(obj.list)[i], ".png")
+  ggsave(plot_filename, combined_plot, width = 16, height = 10)
+  
+  p3 <- VlnPlot(obj.list[[i]], c("nFeature_RNA", "nCount_RNA"), group.by = "doublet_finder", slot = "counts")
+  print(p3)
+  plot_filename <- paste0("../sc2atlas_mouse", "/doublet_detection_vln_plot_", names(obj.list)[i], ".png")
+  ggsave(plot_filename, p3, width = 16, height = 10)
+}
+```
+
+```{r}
+# Save obj.list as an RData file.
+saveRDS(obj.list, file = "../Rdata/knafo_objlist_annotated_dbl.rds")
+```
+
+```{r}
+# Remove Knaf1 and Knaf2 (MACS) from obj.list.
+obj.list <- obj.list[!names(obj.list) %in% c("Knaf1_En1Sun1GFPNeuN", "Knaf2_En1SunGFPNeuN")]
+```
+
+```{r}
+# 2.5.3. Merge obj.list into a single object to visualize the singlets and droplets for all the samples.
+samples_names <- names(obj.list)
+sc2atlas.unfiltered.dbl <- Merge_Seurat_List(obj.list, add.cell.ids = samples_names, project = "knafo", merge.data = TRUE)
+
+# Standard Seurat workflow.
+sc2atlas.unfiltered.dbl <- SCTransform(sc2atlas.unfiltered.dbl, vst.flavor = "v1")
+sc2atlas.unfiltered.dbl <- RunPCA(sc2atlas.unfiltered.dbl, nfeatures.print = 5)
+ElbowPlot(sc2atlas.unfiltered.dbl, ndims = 50, reduction = "pca")
+sc2atlas.unfiltered.dbl <- RunUMAP(sc2atlas.unfiltered.dbl, reduction = "pca", dims = 1:30)
+sc2atlas.unfiltered.dbl <- RunTSNE(sc2atlas.unfiltered.dbl, reduction = "pca", dims = 1:30)
+```
+
+```{r}
+# Visualize the doublets.
+# UMAP plot.
+p1 <- apply_theme(DimPlot(sc2atlas.unfiltered.dbl, reduction = "umap", group.by = "doublet_finder"), "Doublets detection - Knafo mice samples")
+p2 <- apply_theme(DimPlot(sc2atlas.unfiltered.dbl, reduction = "umap", group.by = "doublet_finder", split.by = "doublet_finder"), "Doublets detection - Knafo mice samples")
+combined_plot1 <- p1 + p2
+print(combined_plot1)
+# tSNE plot.
+p1 <- apply_theme(DimPlot(sc2atlas.unfiltered.dbl, reduction = "tsne", group.by = "doublet_finder"), "Doublets detection - Knafo mice samples")
+p2 <- apply_theme(DimPlot(sc2atlas.unfiltered.dbl, reduction = "tsne", group.by = "doublet_finder", split.by = "doublet_finder"), "Doublets detection - Knafo mice samples")
+combined_plot2 <- p1 + p2
+print(combined_plot2)
+# Violin plot.
+p3 <- VlnPlot(sc2atlas.unfiltered.dbl, c("nFeature_RNA", "nCount_RNA"), group.by = "doublet_finder", slot = "counts")
+print(p3)
+p4 <- VlnPlot(sc2atlas.unfiltered.dbl, c("nFeature_SCT", "nCount_SCT"), group.by = "doublet_finder")
+print(p4)
+p5 <- VlnPlot(sc2atlas.unfiltered.dbl, c("nFeature_RNA", "nCount_RNA"), group.by = "doublet_finder", slot = "counts", pt.size = 0)
+print(p5)
+p6 <- VlnPlot(sc2atlas.unfiltered.dbl, c("nFeature_SCT", "nCount_SCT"), group.by = "doublet_finder", pt.size = 0)
+print(p6)
+
+# Create knafo directory inside sc2atlas_mouse directory at the same level as R_scripts
+if (!dir.exists("../sc2atlas_mouse/knafo")) {
+  dir.create("../sc2atlas_mouse/knafo")
+}
+
+# Save the plots.
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "doublet_detection_plot_umap.png")
+ggsave(plot_filename, combined_plot1, width = 16, height = 10)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "doublet_detection_plot_tsne.png")
+ggsave(plot_filename, combined_plot2, width = 16, height = 10)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "doublet_detection_vln_plot.png")
+ggsave(plot_filename, p3, width = 16, height = 10)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "doublet_detection_vln_plot_sctransform.png")
+ggsave(plot_filename, p4, width = 16, height = 10)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "doublet_detection_vln_plot_v2s.png")
+ggsave(plot_filename, p5, width = 16, height = 10)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "doublet_detection_vln_plot_sctransform_v2s.png")
+ggsave(plot_filename, p6, width = 16, height = 10)
+```
+
+```{r}
+# 2.5.4. Subset each sample to remove doublets and save the filtered seurat objects.
+for (i in 1:length(obj.list)) {
+  # Remove doublets.
+  obj.list[[i]] <- subset(obj.list[[i]], subset = doublet_finder == "Singlet")
+}
+# Merge.
+sc2atlas.filtered.dbl <- Merge_Seurat_List(obj.list, add.cell.ids = samples_names, project = "knafo", merge.data = TRUE)
+sc2atlas.filtered.dbl[["percent_mito"]] <- PercentageFeatureSet(sc2atlas.filtered.dbl, pattern = "^mt-") 
+sc2atlas.filtered.dbl <- subset(sc2atlas.filtered.dbl, subset = nFeature_RNA > 200 & percent_mito < 10)
+```
+
+```{r}
+# 2.5.5. Load the filtered seurat objects.
+# Clean the environment.
+#rm(list = ls())
+# Reload the filtered seurat objects.
+#sc2atlas.filtered.dbl <- readRDS(file = "sc2atlas_filtered_dbl.rds")
+
+# Create tables for unfiltered and filtered singlet counts
+unfiltered_counts <- table(sc2atlas.unfiltered.dbl$orig.ident)
+filtered_counts <- table(sc2atlas.filtered.dbl$orig.ident)
+
+# Convert tables to data frames
+unfiltered_df <- as.data.frame(unfiltered_counts)
+filtered_df <- as.data.frame(filtered_counts)
+
+# Merge both data frames by sample names
+merged_df <- merge(unfiltered_df, filtered_df, by = "Var1", suffixes = c("_before", "_after"))
+
+# Calculate the doublets as the difference between unfiltered and filtered counts
+merged_df$doublets <- merged_df$Freq_before - merged_df$Freq_after
+
+# Rename columns for clarity
+colnames(merged_df) <- c("Sample", "Cells_Before", "Cells_After", "Detected_Doublets")
+
+# Save the merged table as a single CSV file
+write.csv(merged_df, file = "../sc2atlas_mouse/knafo/cell_counts_knafo.csv", row.names = FALSE)
+
+Idents(sc2atlas.filtered.dbl) <- "orig.ident"
+```
+Number of doublets removed per sample :
+- Knaf1_En1Sun1GFPNeuN : 1398 - 1388 = 10
+- Knaf2_En1Sun1GFPNeuN : 2919 - 2853 = 66
+- Knaf3_En1Sun1NeuN : 3722 - 3611 = 111
+- Knaf4_En1Sun1GFPNeuN_CITEseq : 1952 - 1924 = 28
+- Kathe_GSM5585219 : 2525 - 2470 = 55
+- Kathe_GSM5585220 : 3218 - 3145 = 73
+- Kathe_GSM5585221 : 2854 - 2793 = 61
+- Mantson_GSM5243301 : 2708 - 2649 = 59
+- Mantson_GSM5243302 : 3188 - 3115 = 73
+- Mantson_GSM5243303 : 2841 - 2780 = 61
+- Total : 26728 - 26131 = 597 doublets removed.
+
+Number of cells filtered in total :
+- Knaf1_En1Sun1GFPNeuN : 1400 - 1388 = 12
+- Knaf2_En1Sun1GFPNeuN : 2927 - 2853 = 74
+- Knaf3_En1Sun1NeuN : 3722 - 3611 = 111
+- Knaf4_En1Sun1GFPNeuN_CITEseq : 1952 - 1924 = 28
+- Kathe_GSM5585219 : 2584 - 2470 = 114
+- Kathe_GSM5585220 : 3315 - 3145 = 170
+- Kathe_GSM5585221 : 2894 - 2793 = 101
+- Mantson_GSM5243301 : 2764 - 2649 = 115
+- Mantson_GSM5243302 : 3272 - 3115 = 157
+- Mantson_GSM5243303 : 2878 - 2780 = 98 
+- Total : 27708 - 26728 = 980 cells filtered in total.
+
+```{r}
+# Median stats.
+median_stats <- Median_Stats(sc2atlas.filtered.dbl, group_by_var = "orig.ident")
+median_stats
+```
+
+## 3. Data normalization, highly variable feature selection, data scaling and dimensional reduction. 
+### 3.1. Log normalization.
+```{r}
+# 3.1.A. Normalize the data.
+sc2atlas_lognorm <- NormalizeData(sc2atlas.filtered.dbl, normalization.method = "LogNormalize", scale.factor = 10000) # Normalize the data to account for sequencing depth. Conventional way is to divide the feature counts for each cell by the total counts for that cell, scale it to 10,000 (as if all cells have 10k UMIs overall), and log1p-transform the obtained values.
+# 3.1.B. Identify the most variable features and plot them.
+sc2atlas_lognorm[["RNA"]] <- JoinLayers(sc2atlas_lognorm[["RNA"]]) 
+sc2atlas_lognorm <- FindVariableFeatures(sc2atlas_lognorm, selection.method = "vst", nfeatures = 10000) # Limit the number of features to select to 10000. from 21592.
+VariableFeaturePlot_scCustom(sc2atlas_lognorm, num_features = 20)
+#VariableFeaturePlot_scCustom(sc2atlas, num_features = 20, label = FALSE)
+# 3.1.C. Scale the data.
+sc2atlas_lognorm[["RNA"]] <- split(sc2atlas_lognorm[["RNA"]], f = sc2atlas_lognorm$orig.ident)
+sc2atlas_lognorm <- ScaleData(sc2atlas_lognorm, features = rownames(sc2atlas_lognorm)) # Convert normalized gene expression to Z-scores (values centered at 0 with variance of 1). Default is to run scaling only on variable genes.
+# 3.1.D. Perform PCA on the scaled data (linear dimensionality reduction).
+sc2atlas_lognorm <- RunPCA(sc2atlas_lognorm, features = VariableFeatures(sc2atlas_lognorm, nfeatures = 10000), nfeatures.print = 5) # If features=NULL, PCA runs using the variable features for the Assay. The features must be present in the scaled data. Features that are not scaled or have 0 variance will be dropped, and the PCA will be run using the remaining features. Here, the number of genes to be considered for PCA is 10000.
+cat("Total number of principal components (PCs) in the PCA result:", length(sc2atlas_lognorm[["pca"]]), "\n")
+#PC_Plotting(sc2atlas_lognorm, dim_number = 1)
+#PC_Plotting(sc2atlas_lognorm, dim_number = 2)
+#PC_Plotting(sc2atlas_lognorm, dim_number = 50)
+```
+
+### 3.2. SCTransform normalization.
+```{r}
+# 3.2. SCTransform normalization.
+sc2atlas_sct <- SCTransform(sc2atlas.filtered.dbl, vst.flavor = "v1")
+sc2atlas_sct <- RunPCA(sc2atlas_sct, nfeatures.print = 5)
+```
+
+```{r}
+# Load the neurons_only Seurat object
+neurons <- readRDS("../Rdata/knafo_mice_neurons_only.rds")
+neurons <- SCTransform(neurons, vst.flavor = "v1")
+neurons <- RunPCA(neurons, nfeatures.print = 5)
+```
+
+```{r}
+# 3.3. Plot the PCA by sample for both normalization methods.
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+
+#order = c("Knaf1_En1Sun1GFPNeuN", "Knaf2_En1Sun1GFPNeuN", "Knaf3_En1Sun1NeuN", "Knaf4_En1Sun1GFPNeuN_CITEseq", "Kathe_GSM5585219", "Kathe_GSM5585220", "Kathe_GSM5585221", "Mantson_GSM5243301", "Mantson_GSM5243302", "Mantson_GSM5243303")
+order = c("BOUV5_M1_SC1_280421", "Knaf3_En1Sun1NeuN", "Knaf4_En1Sun1GFPNeuN_CITEseq")
+inverse_order = rev(order)
+
+#plot1 <- DimPlot(sc2atlas_lognorm, reduction = "pca", group.by = "orig.ident", order = inverse_order) 
+#plot1 <- apply_theme(plot1, "Samples distribution in PCA space - Standard normalization")
+#print(plot1)
+#plot_filename <- paste0("sc2atlas", "/pca_plot_lognorm.png")
+#ggsave(plot_filename, plot1, width = 10, height = 8)
+
+#plot2 <- DimPlot(sc2atlas_lognorm, reduction = "pca", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order)
+#plot2 <- apply_theme(plot2, "Samples distribution in PCA space - Standard normalization")
+#print(plot2)
+#plot_filename <- paste0("sc2atlas", "/pca_plot_lognorm_split.png")
+#ggsave(plot_filename, plot2, width = 16, height = 10)
+
+plot3 <- DimPlot(sc2atlas_sct, reduction = "pca", group.by = "orig.ident", order = inverse_order) 
+plot3 <- apply_theme(plot3, "Samples distribution in PCA space - SCTransform normalization")
+print(plot3)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "pca_plot_sctransform.png")
+ggsave(plot_filename, plot3, width = 10, height = 8)
+
+plot4 <- DimPlot(sc2atlas_sct, reduction = "pca", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order)
+plot4 <- apply_theme(plot4, "Samples distribution in PCA space - SCTransform normalization")
+print(plot4)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "pca_plot_sctransform_split.png")
+ggsave(plot_filename, plot4, width = 16, height = 10)
+```
+
+```{r}
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+
+order = c("BOUV5_M1_SC1_280421", "Knaf3-4_En1Sun1NeuN-GFPNeuNCITEseq")
+inverse_order = rev(order)
+
+plot3 <- DimPlot(neurons, reduction = "pca", group.by = "orig.ident", order = inverse_order) 
+plot3 <- apply_theme(plot3, "Samples distribution in PCA space - SCTransform normalization")
+print(plot3)
+plot_filename <- paste0("../neurons_mouse/knafo/", "pca_plot_sctransform.png")
+ggsave(plot_filename, plot3, width = 10, height = 8)
+
+plot4 <- DimPlot(neurons, reduction = "pca", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order)
+plot4 <- apply_theme(plot4, "Samples distribution in PCA space - SCTransform normalization")
+print(plot4)
+plot_filename <- paste0("../neurons_mouse/knafo/", "pca_plot_sctransform_split.png")
+ggsave(plot_filename, plot4, width = 16, height = 10)
+```
+
+```{r}
+# Plot the violin plots for the first two PCs.
+plot1 <- VlnPlot(sc2atlas_lognorm, features = c("PC_1", "PC_2"), pt.size = 0.1, slot = "data")
+print(plot1)
+plotfilename <- paste0("sc2atlas", "/vln_plot_lognorm_pca_embeddings.png")
+ggsave(plotfilename, plot1, width = 12, height = 6)
+plot1bis <- VlnPlot(sc2atlas_lognorm, features = c("PC_1", "PC_2"), pt.size = 0, slot = "data")
+print(plot1bis)
+plotfilename <- paste0("sc2atlas", "/vln_plot_lognorm_pca_embeddings_v2.png")
+ggsave(plotfilename, plot1bis, width = 12, height = 6)
+
+plot2 <- VlnPlot(sc2atlas_sct, features = c("PC_1", "PC_2"), pt.size = 0.1, slot = "data")
+print(plot2)
+plotfilename <- paste0("sc2atlas", "/vln_plot_sctransform_pca_embeddings.png")
+ggsave(plotfilename, plot2, width = 12, height = 6)
+plot2bis <- VlnPlot(sc2atlas_sct, features = c("PC_1", "PC_2"), pt.size = 0, slot = "data")
+print(plot2bis)
+plotfilename <- paste0("sc2atlas", "/vln_plot_sctransform_pca_embeddings_v2.png")
+ggsave(plotfilename, plot2bis, width = 12, height = 6)
+```
+
+```{r}
+# Median stats after normalization.
+median_stats <- Median_Stats(sc2atlas_lognorm, group_by_var = "orig.ident")
+median_stats
+
+median_stats <- Median_Stats(sc2atlas_sct, group_by_var = "orig.ident", default_var = FALSE, median_var = c("nFeature_SCT", "nCount_SCT"))
+median_stats
+```
+
+## 4. Check unwanted variation.
+### 4.1. Effects of cell cycle.
+```{r}
+# 4.1.A. Cell cycle scoring.
+# Read the Ensembl IDs list corresponding to the cell cycle genes for Mus musculus.
+cc_genes <- read.csv("Mus_musculus.csv")
+# Connect to the Bioconductor AnnotationHub service.
+annot_hub <- AnnotationHub()
+# Access the Ensemble database for Mus musculus.
+annot_db <- query(annot_hub, pattern = c("Mus musculus", "EnsDb"), ignore.case = TRUE)
+# Identify and download the latest Ensemble database.
+id <- annot_db %>%
+        mcols() %>%
+        rownames() %>%
+        tail(n = 1) # Get the last one.
+ensembl_db <- annot_db[[id]]
+# Extract the gene-level annotation information from the Ensembl database.
+annotations <- genes(ensembl_db, return.type = "data.frame")
+# Select annotations of interest.
+annotations <- annotations %>%
+        dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+# Get gene names for each Ensembl ID in the list.
+cc_markers <- dplyr::left_join(cc_genes, annotations, by = c("geneID" = "gene_id"))
+# S phase genes.
+s_genes <- cc_markers %>%
+        dplyr::filter(phase == "S") %>%
+        pull("gene_name")
+# G2/M phase genes.
+g2m_genes <- cc_markers %>%
+        dplyr::filter(phase == "G2/M") %>%
+        pull("gene_name")
+```
+
+```{r}
+# 4.1.B. Perform cell cycle scoring.
+sc2atlas_lognorm[["RNA"]] <- JoinLayers(sc2atlas_lognorm[["RNA"]]) 
+sc2atlas_lognorm <- CellCycleScoring(sc2atlas_lognorm, s.features = s_genes, g2m.features = g2m_genes, assay = "RNA", slot = "data")
+sc2atlas_lognorm[["RNA"]] <- split(sc2atlas_lognorm[["RNA"]], f = sc2atlas_lognorm$orig.ident)
+
+sc2atlas_sct[["RNA"]] <- JoinLayers(sc2atlas_sct[["RNA"]])
+sc2atlas_sct <- CellCycleScoring(sc2atlas_sct, s.features = s_genes, g2m.features = g2m_genes, assay = "SCT", slot = "data")
+sc2atlas_sct[["RNA"]] <- split(sc2atlas_sct[["RNA"]], f = sc2atlas_sct$orig.ident)
+# View cell cycle scores and phases assigned to cells.     
+#View(sc2atlas_sct@meta.data)
+```
+
+```{r}
+# 4.1.C. Plot the PCA by cell cycle phase.
+plot1 <- apply_theme(DimPlot(sc2atlas_lognorm, reduction = "pca", group.by = "Phase"), "Cell cycle distribution in PCA space - Standard normalization")
+plot2 <- apply_theme(DimPlot(sc2atlas_lognorm, reduction = "pca", group.by = "Phase", split.by = "Phase"), "Cell cycle stages in PCA space - Standard normalization")
+combined_plot <- plot1 + plot2
+print(combined_plot)
+plot_filename <- paste0("sc2atlas", "/pca_plot_cellcycle_lognorm.png")
+ggsave(plot_filename, combined_plot, width = 18, height = 9)
+
+plot3 <- apply_theme(DimPlot(sc2atlas_sct, reduction = "pca", group.by = "Phase"), "Cell cycle distribution in PCA space - SCTransform normalization")
+plot4 <- apply_theme(DimPlot(sc2atlas_sct, reduction = "pca", group.by = "Phase", split.by = "Phase"), "Cell cycle stages in PCA space - SCTransform normalization")
+combined_plot <- plot3 + plot4
+print(combined_plot)
+plot_filename <- paste0("sc2atlas", "/pca_plot_cellcycle_sct.png")
+ggsave(plot_filename, combined_plot, width = 18, height = 9)
+```
+
+### 4.2. Effects of mitochondrial expression.
+```{r}
+# 4.2.A. Check quartile values & turn percent_mito into categorical factor vector based on quartile values.
+# NB : First, create a new function to calculate the percentage of mitochondrial genes expression per cell for the NORMALIZED data. 
+# Indeed, the PercentageFeatureSet function calculates the percentage of mitochondrial genes expression per cell for the RAW (non-normalized) data.
+`%||%` <- function(lhs, rhs) { 
+   if (!is.null(x = lhs)) { 
+     return(lhs) 
+   } else { 
+     return(rhs) 
+   } 
+ }
+PercentageFeatureSetNorm <- function(
+  object,
+  pattern = NULL,
+  features = NULL,
+  col.name = NULL,
+  assay = NULL
+) {
+  assay <- assay %||% DefaultAssay(object = object)
+  if (!is.null(x = features) && !is.null(x = pattern)) {
+    warn(message = "Both pattern and features provided. Pattern is being ignored.")
+  }
+  percent.featureset <- list()
+  layers <- Layers(object = object, search = "data")
+  for (i in seq_along(along.with = layers)) {
+    layer <- layers[i]
+    features.layer <- features %||% grep(
+      pattern = pattern,
+      x = rownames(x = object[[assay]][layer]),
+      value = TRUE)
+    layer.data <- LayerData(object = object,
+                            assay = assay,
+                            layer = layer)
+    layer.sums <- colSums(x = layer.data[features.layer, , drop = FALSE])
+    layer.perc <- layer.sums / object[[]][colnames(layer.data), paste0("nCount_", assay)] * 100
+    percent.featureset[[i]] <- layer.perc
+  }
+  percent.featureset <- unlist(percent.featureset)
+  if (!is.null(x = col.name)) {
+    object <- AddMetaData(object = object, metadata = percent.featureset, col.name = col.name)
+    return(object)
+  }
+  return(percent.featureset)
+}
+
+# Calculate the percentage of mitochondrial gene expression per cell for the normalized data.
+sc2atlas_lognorm[["percent_mito_norm"]] <- PercentageFeatureSetNorm(sc2atlas_lognorm, pattern = "^mt-")
+sc2atlas_sct[["percent_mito_SCT"]] <- PercentageFeatureSet(sc2atlas_sct, pattern = "^mt-") # Not needed for the SCTransform normalized data (it is handled internally by the SCTansform function).
+# Calculate the quartile values for the percentage of mitochondrial genes expression.
+summary(sc2atlas_lognorm@meta.data$percent_mito_norm)
+summary(sc2atlas_sct@meta.data$percent_mito_SCT)
+# Turn the percentage of mitochondrial genes expression into a categorical factor vector based on quartile values.
+sc2atlas_lognorm@meta.data$mitoFr <- cut(sc2atlas_lognorm@meta.data$percent_mito_norm, 
+                   breaks=c(-Inf, 0.2500, 0.5488, 0.9793, Inf), 
+                   labels=c("Low - Q1","Medium - Q2","Medium high - Q3", "High - Q4"))
+sc2atlas_sct@meta.data$mitoFr <- cut(sc2atlas_sct@meta.data$percent_mito_SCT, 
+                   breaks=c(-Inf, 0.1927, 0.4110, 0.7871, Inf), 
+                   labels=c("Low - Q1","Medium - Q2","Medium high - Q3", "High - Q4"))
+# Q1: from -Inf to 0.2500, Q2: from 0.2500 to 0.5488, Q3: from 0.5488 to 0.9793, Q4: from 0.9793 to Inf. -inf and Inf are the lowest and highest values in the data.
+
+# 4.2.B. Plot the PCA by mitochondrial fraction (mitochondrial genes expression).
+plot1 <- apply_theme(DimPlot(sc2atlas_lognorm, reduction = "pca", group.by= "mitoFr", split.by = "mitoFr"), "Distribution of mitochondrial UMIs quartiles in PCA space - Standard normalization")
+print(plot1)
+plot_filename <- paste0("sc2atlas", "/pca_plot_mito_lognorm.png")
+ggsave(plot_filename, plot1, width = 10, height = 8)
+
+plot2 <- apply_theme(DimPlot(sc2atlas_sct, reduction = "pca", group.by= "mitoFr", split.by = "mitoFr"), "Distribution of mitochondrial UMIs quartiles in PCA space - SCTransform normalization")
+print(plot2)
+plot_filename <- paste0("sc2atlas", "/pca_plot_mito_sct.png")
+ggsave(plot_filename, plot2, width = 10, height = 8)
+```
+
+```{r}
+# Which genes contribute the most to the 2 first principal components? Are mitochondrial genes between them?
+PC_Plotting(sc2atlas_lognorm, dim_number = 1)
+PC_Plotting(sc2atlas_lognorm, dim_number = 2)
+PC_Plotting(sc2atlas_sct, dim_number = 1)
+PC_Plotting(sc2atlas_sct, dim_number = 2)
+
+# Old normalization method:
+cat("Old normalization method:\n")
+# Assuming pca_loadings is already calculated
+pca_loadings <- sc2atlas_lognorm[["pca"]]@feature.loadings
+# Extract gene names for PC1.
+genes_pc1 <- rownames(pca_loadings)[order(pca_loadings[, "PC_1"], decreasing = TRUE)]
+mt_genes <- genes_pc1[grep("^mt-", genes_pc1, ignore.case = TRUE)]
+cat("Mitochondrial genes in PC1:\n")
+print(mt_genes)
+#page(genes_pc1, method = "print") # PC_1 genes.
+# Extract gene names for PC2.
+genes_pc2 <- rownames(pca_loadings)[order(pca_loadings[, "PC_2"], decreasing = TRUE)]
+mt_genes <- genes_pc2[grep("^mt-", genes_pc2, ignore.case = TRUE)]
+cat("Mitochondrial genes in PC2:\n")
+print(mt_genes)
+#page(genes_pc2, method = "print") # PC_2 genes.
+
+# SCTransform normalized data:
+cat("SCTransform normalized data:\n")
+pca_loadings <- sc2atlas_sct[["pca"]]@feature.loadings
+genes_pc1 <- rownames(pca_loadings)[order(pca_loadings[, "PC_1"], decreasing = TRUE)]
+mt_genes <- genes_pc1[grep("^mt-", genes_pc1, ignore.case = TRUE)]
+cat("Mitochondrial genes in PC1:\n")
+print(mt_genes)
+genes_pc2 <- rownames(pca_loadings)[order(pca_loadings[, "PC_2"], decreasing = TRUE)]
+mt_genes <- genes_pc2[grep("^mt-", genes_pc2, ignore.case = TRUE)]
+cat("Mitochondrial genes in PC2:\n")
+print(mt_genes)
+
+# Does the mitochondrial genes expression separate the samples (possible batch effect)? 
+p1 <- FeaturePlot_scCustom(sc2atlas_lognorm, features = mt_genes)
+print(p1)
+plot_filename <- paste0("sc2atlas", "/feature_plot_mito_lognorm.png")
+ggsave(plot_filename, p1, width = 16, height = 10)
+p2 <- FeaturePlot_scCustom(sc2atlas_sct, features = mt_genes)
+print(p2)
+plot_filename <- paste0("sc2atlas", "/feature_plot_mito_sct.png")
+ggsave(plot_filename, p2, width = 16, height = 10)
+```
+
+```{r}
+# Plot the violin plots for the mitochondrial genes.
+# Non-normalized data.
+VlnPlot(sc2atlas.filtered.dbl, features = mt_genes, split.by = "orig.ident", slot = "count")
+# Old normalization method.
+p1 <- VlnPlot(sc2atlas_lognorm, features = mt_genes, split.by = "orig.ident", slot = "scale.data")
+p1
+plot_filename <- paste0("sc2atlas", "/vln_plot_mito_lognorm.png")
+ggsave(plot_filename, p1, width = 16, height = 10)
+# SCTransform normalized data.
+p2 <- VlnPlot(sc2atlas_sct, features = mt_genes, split.by = "orig.ident", slot = "data", layer = "scale.data")
+p2
+plot_filename <- paste0("sc2atlas", "/vln_plot_mito_sct.png")
+ggsave(plot_filename, p2, width = 16, height = 10)
+
+# Plot the scatter plots for the number of transcripts detected vs. the percentage of mitochondrial genes expression.
+FeatureScatter(sc2atlas.filtered.dbl, feature1 = "nCount_RNA", feature2 = "percent_mito", split.by = "orig.ident", slot = "count")
+FeatureScatter(sc2atlas_sct, feature1 = "nCount_SCT", feature2 = "percent_mito_SCT", split.by = "orig.ident")
+
+# Plot the violin plots for the number of transcripts detected and the percentage of mitochondrial genes expression.
+VlnPlot(sc2atlas.filtered.dbl, features = c('nCount_RNA', 'percent_mito'), pt.size = 0, slot = "counts")
+VlnPlot(sc2atlas_sct, features = c('nCount_SCT', 'percent_mito_SCT'), pt.size = 0, slot = "scale.data") 
+```
+Given the results, we will keep the SCTransform normalized data for downstream analysis.
+
+## 4.bis Regress out unwanted variation and compare the results.
+### 4.bis.1. Regress out the cell cycle effects.
+We don't want to remove all signal associated with cell cycle. Indeed, this can negatively impact downstream analysis.
+Instead, we will regress out the difference between the G2M and S phase scores. This means that signals separating non-cycling cells and cycling cells will be maintained, but differences in cell cycle phase among proliferating cells (which are often uninteresting), will be regressed out of the data.
+```{r}
+sc2atlas_sct_reg <- sc2atlas_sct
+sc2atlas_sct_reg[["CC.Diff"]] <- sc2atlas_sct_reg$S.Score - sc2atlas_sct_reg$G2M.Score
+sc2atlas_sct_reg <- SCTransform(sc2atlas_sct_reg, vst.flavor = "v1", vars.to.regress = "CC.Diff")
+sc2atlas_sct_reg <- RunPCA(sc2atlas_sct_reg, nfeatures.print = 5)
+```
+
+```{r}
+plot1 <- apply_theme(DimPlot(sc2atlas_sct_reg, reduction = "pca", group.by = "orig.ident", order = inverse_order), "Samples distribution in PCA space - G2M/S variation regressed out")
+plot1
+plot1_filename <- paste0("sc2atlas", "/pca_plot_sct_regressed_cc_samples.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+
+plot2 <- apply_theme(DimPlot(sc2atlas_sct_reg, reduction = "pca", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Samples distribution in PCA space - G2M/S variation regressed out")
+plot2
+plot2_filename <- paste0("sc2atlas", "/pca_plot_sct_regressed_cc_samples_split.png")
+ggsave(plot2_filename, plot2, width = 16, height = 10)
+
+plot3 <- apply_theme(DimPlot(sc2atlas_sct_reg, reduction = "pca", group.by = "Phase"), "Cell cycle distribution in PCA space - G2M/S variation regressed out") 
+plot4 <- apply_theme(DimPlot(sc2atlas_sct_reg, reduction = "pca", group.by = "Phase", split.by = "Phase", order = inverse_order), "Cell cycle stages in PCA space - G2M/S variation regressed out")
+combined_plot <- plot3 + plot4
+print(combined_plot)
+plot_filename <- paste0("sc2atlas", "/pca_plot_sct_regressed_cc_combined_stages.png")
+ggsave(plot_filename, combined_plot, width = 18, height = 9)
+```
+
+### 4.bis.2. Regress out the mitochondrial fraction as a source of unwanted variation.
+```{r}
+sc2atlas_sct_reg_mt <- sc2atlas_sct
+sc2atlas_sct_reg_mt <- SCTransform(sc2atlas_sct_reg_mt, vst.flavor = "v1", vars.to.regress = "mitoFr")
+sc2atlas_sct_reg_mt <- RunPCA(sc2atlas_sct_reg_mt, nfeatures.print = 5)
+```
+
+### 4.bis.3 Regress out both the cell cycle effects and mitochondrial fraction as a source of unwanted variation.
+```{r}
+sc2atlas_sct_reg_f <- sc2atlas_sct
+sc2atlas_sct_reg_f[["CC.Diff"]] <- sc2atlas_sct_reg_f$S.Score - sc2atlas_sct_reg$G2M.Score
+sc2atlas_sct_reg_f <- SCTransform(sc2atlas_sct_reg_f, vst.flavor = "v1", vars.to.regress = c("mitoFr", "CC.Diff"))
+sc2atlas_sct_reg_f <- RunPCA(sc2atlas_sct_reg_f, nfeatures.print = 5)
+```
+
+### 4.bis.4. Perform t-SNE & UMAP for better visualization.
+```{r}
+# 4.bis.4.A. Perform t-SNE.
+sc2atlas_sct <- RunTSNE(sc2atlas_sct, reduction = "pca", dims = 1:30)
+#sc2atlas_sct_reg <- RunTSNE(sc2atlas_sct_reg, reduction = "pca", dims = 1:30)
+#sc2atlas_sct_reg_mt <- RunTSNE(sc2atlas_sct_reg_mt, reduction = "pca", dims = 1:30)
+#sc2atlas_sct_reg_f <- RunTSNE(sc2atlas_sct_reg_f, reduction = "pca", dims = 1:30)
+# 4.bis.4.B. Perform UMAP.
+sc2atlas_sct <- RunUMAP(sc2atlas_sct, reduction = "pca", dims = 1:30)
+#sc2atlas_sct_reg <- RunUMAP(sc2atlas_sct_reg, reduction = "pca", dims = 1:30)
+#sc2atlas_sct_reg_mt <- RunUMAP(sc2atlas_sct_reg_mt, reduction = "pca", dims = 1:30)
+#sc2atlas_sct_reg_f <- RunUMAP(sc2atlas_sct_reg_f, reduction = "pca", dims = 1:30)
+```
+
+```{r}
+# 4.bis.4.C. Plot t-SNE and UMAP.
+plot1 <- apply_theme(DimPlot(sc2atlas_sct, reduction = "tsne", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample in t-SNE space")
+print(plot1)
+plot1_filename <- paste0("../sc2atlas_mouse/knafo/", "tsne_plot_sct.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+
+plot2 <- apply_theme(DimPlot(sc2atlas_sct, reduction = "tsne", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample in t-SNE space")
+print(plot2)
+plot2_filename <- paste0("../sc2atlas_mouse/knafo/", "tsne_plot_sct_split.png")
+ggsave(plot2_filename, plot2, width = 20, height = 10)
+
+plot3 <- apply_theme(DimPlot(sc2atlas_sct, reduction = "umap", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample in UMAP space")
+print(plot3)
+plot3_filename <- paste0("../sc2atlas_mouse/knafo/", "umap_plot_sct.png")
+ggsave(plot3_filename, plot3, width = 10, height = 8)
+
+plot4 <- apply_theme(DimPlot(sc2atlas_sct, reduction = "umap", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample in UMAP space")
+print(plot4)
+plot4_filename <- paste0("../sc2atlas_mouse/knafo/", "umap_plot_sct_split.png")
+ggsave(plot4_filename, plot4, width = 20, height = 10)
+```
+
+```{r}
+# 4.bis.5. Analyze the batch effect between samples before and after regressing out cc & mt variation.
+VlnPlot(sc2atlas.filtered.dbl, features = mt_genes, pt.size = 0, slot = "counts")
+
+p1 <- VlnPlot(sc2atlas_sct, features = mt_genes, pt.size = 0, slot = "data")
+p1
+p1_filename <- paste0("sc2atlas", "/vln_plot_sct_mtgenes_data.png")
+ggsave(p1_filename, p1, width = 16, height = 10)
+
+p2 <- VlnPlot(sc2atlas_sct, features = mt_genes, pt.size = 0, slot = "scale.data")
+p2
+p2_filename <- paste0("sc2atlas", "/vln_plot_sct_mtgenes_scaledata.png")
+ggsave(p2_filename, p2, width = 16, height = 10)
+
+
+p3 <- VlnPlot(sc2atlas_sct_reg_mt, features = mt_genes, pt.size = 0, slot = "scale.data")
+p3
+p3_filename <- paste0("sc2atlas", "/vln_plot_sct_regressed_mt_mtgenes_scaledata.png")
+ggsave(p3_filename, p3, width = 16, height = 10)
+
+p4 <- VlnPlot(sc2atlas_sct, features = c("PC_1", "PC_2"), pt.size = 0)
+p4 
+p4_filename <- paste0("sc2atlas", "/vln_plot_sct_pca_embeddings.png")
+ggsave(p4_filename, p4, width = 12, height = 6)
+
+p5 <- VlnPlot(sc2atlas_sct_reg, features = c("PC_1", "PC_2"), pt.size = 0)
+p5
+p5_filename <- paste0("sc2atlas", "/vln_plot_sct_regressed_cc_pca_embeddings.png")
+ggsave(p5_filename, p5, width = 12, height = 6)
+
+p6 <- VlnPlot(sc2atlas_sct_reg_mt, features = c("PC_1", "PC_2"), pt.size = 0)
+p6
+p6_filename <- paste0("sc2atlas", "/vln_plot_sct_regressed_mt_pca_embeddings.png")
+ggsave(p6_filename, p6, width = 12, height = 6)
+```
+
+Given the results, we will keep the SCTransform normalized data without regressing out the cell cycle and mitochondrial fraction as a source of unwanted variation for downstream analysis.
+
+```{r}
+# Plot gene expression in 2D space.
+# UMAP
+p1 <- apply_theme(FeaturePlot_scCustom(sc2atlas_sct, features = "nFeature_SCT", reduction = "umap"), "Gene expression landscape across cells")
+p1
+p1_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_nFeature_SCT_umap.png")
+ggsave(p1_filename, p1, width = 10, height = 8)
+# Neurons have around 5k expressed genes, whereas the other nervous system types of cells have around 3k expressed genes.
+# t-SNE.
+p2 <- apply_theme(FeaturePlot_scCustom(sc2atlas_sct, features = "nFeature_SCT", reduction = "tsne"), "Gene expression landscape across cells")
+p2
+p2_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_nFeature_SCT_tsne.png")
+ggsave(p2_filename, p2, width = 10, height = 8)
+
+# For each sample separately.
+#FeaturePlot_scCustom(sc2atlas_sct, features = "nFeature_SCT", split.by = "orig.ident", num_columns = 2, reduction = "umap")
+```
+
+```{r}
+# Save the Seurat object.
+saveRDS(sc2atlas_sct, file = "sc2atlas_sct.rds")
+```
+
+```{r}
+# Clear the environment.
+rm(list = ls())
+# Load the filtered, normalized Seurat object.
+sc2atlas_sct <- readRDS("sc2atlas_sct.rds")
+```
+
+
+## 5.0 CITE-seq data.
+### 5.0.1. Visualize the Antibody-Derived Tag CITE-seq data.
+The CITE-seq data allows us to visualize the expression of protein markers in the same cells that were profiled for RNA expression. 
+```{r}
+sc2atlas_mice <- sc2atlas_sct
+# 5.0.1.A. Change to the antibody assay.
+DefaultAssay(sc2atlas_mice) <- "antibody_counts"
+DefaultAssay(sc2atlas_mice)
+```
+
+```{r}
+# 5.0.1.B. Visualize the expression of the GFP-TotalSeqC feature before normalization.
+# UMAP
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+p1 <- apply_theme(FeaturePlot(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "umap"), "GFP-TotalSeqC expression across cells - Pre-normalization")
+p1
+p1_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_umap.png")
+ggsave(p1_filename, p1, width = 10, height = 8)
+p2 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "umap", na_cutoff = 0), "GFP-TotalSeqC expression across cells - Pre-normalization")
+p2
+ggsave(p2_filename, p2, width = 10, height = 8)
+p2_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_umap_na_cutoff_0.png")
+p3 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "umap", na_cutoff = 10), "GFP-TotalSeqC expression across cells - Pre-normalization - Cutoff of 10")
+p3
+p3_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_umap_na_cutoff_10.png")
+ggsave(p3_filename, p3, width = 10, height = 8)
+
+# t-SNE
+p4 <- apply_theme(FeaturePlot(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "tsne"), "GFP-TotalSeqC expression across cells - Pre-normalization")
+p4
+p4_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne.png")
+ggsave(p4_filename, p4, width = 10, height = 8)
+p5 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "tsne", na_cutoff = 0), "GFP-TotalSeqC expression across cells - Pre-normalization")
+p5
+p5_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne_na_cutoff_0.png")
+ggsave(p5_filename, p5, width = 10, height = 8)
+p6 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "tsne", na_cutoff = 10), "GFP-TotalSeqC expression across cells - Pre-normalization - Cutoff of 10")
+p6
+p6_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne_na_cutoff_10.png")
+ggsave(p6_filename, p6, width = 10, height = 8)
+```
+
+```{r}
+# 5.0.1.C. Normalize the Antibody-Derived Tag (ADT) data.
+# In this case, we normalize the data using the centered log-ratio (CLR) method and apply it across the cells (margin = 2).
+# This means the CLR normalization process will adjust the expression levels of the feature across different cells based on the distribution of its expression values across these cells.
+
+# NB: When applying CLR normalization to Antibody-Derived Tag (ADT) data, such as cell surface protein counts in a single-cell dataset, we're essentially handling the expression levels of proteins marked with antibodies. This type of data is similar to gene expression data in that it can vary significantly between cells due to differences in capture efficiency, cell size, and other technical or biological factors.
+
+# Since Seurat does not provide a built-in function to normalize unidimensional ADT data (only bidimensional data), we will create a custom function to perform this normalization.
+
+# Custom CLR Normalization for unidimensional assay data.
+NormalizeADTData <- function(object, assay = NULL, verbose = TRUE) {
+  if (is.null(assay)) {
+    assay <- DefaultAssay(object)
+  }
+  # Accessing the counts data
+  counts <- GetAssayData(object = object[[assay]], slot = "counts")
+  # Ensure the data is unidimensional and is a matrix
+  if (is(counts, "Matrix") && nrow(counts) == 1) {
+    if (verbose) {
+      message("Applying CLR normalization on unidimensional assay data")
+    }
+    
+    # CLR normalization: Normalize the expression of each cell
+    # Calculate the geometric mean using non-zero values only
+    non_zero_counts <- counts[counts > 0]
+    geo_mean <- exp(sum(log1p(non_zero_counts)) / length(counts))
+    # Normalize counts
+    normalized_counts <- log1p(counts / geo_mean)
+    
+    # Updating the data slot with the normalized counts
+    object[[assay]] <- SetAssayData(
+      object = object[[assay]],
+      slot = "data",
+      new.data = Matrix::Matrix(normalized_counts, sparse = TRUE)
+    )
+  } else {
+    stop("Provided assay data is not unidimensional or is not a proper matrix type.")
+  }
+  
+  # Logging command for reproducibility
+  object <- LogSeuratCommand(object)
+  
+  return(object)
+}
+
+sc2atlas_mice <- NormalizeADTData(sc2atlas_mice, assay = "antibody_counts")
+```
+
+```{r}
+# 5.0.1.D. Visualize the expression of the GFP-TotalSeqC feature after normalization.
+# UMAP
+p1 <- apply_theme(FeaturePlot(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "umap"), "GFP-TotalSeqC expression across cells - Post-normalization")
+p1
+p1_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_umap_normalized.png")
+ggsave(p1_filename, p1, width = 10, height = 8)
+p2 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "umap", na_cutoff = 0.1), "GFP-TotalSeqC expression across cells - Post-normalization - Cutoff of 0.1")
+p2
+p2_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_umap_normalized_na_cutoff_0.1.png")
+ggsave(p2_filename, p2, width = 10, height = 8)
+p3 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "umap", na_cutoff = 0.2), "GFP-TotalSeqC expression across cells - Post-normalization - Cutoff of 0.2")
+p3
+p3_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_umap_normalized_na_cutoff_0.2.png")
+ggsave(p3_filename, p3, width = 10, height = 8)
+
+# t-SNE
+p4 <- apply_theme(FeaturePlot(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "tsne"), "GFP-TotalSeqC expression across cells - Post-normalization")
+p4
+p4_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne_normalized.png")
+ggsave(p4_filename, p4, width = 10, height = 8)
+p5 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "tsne", na_cutoff = 0.1), "GFP-TotalSeqC expression across cells - Post-normalization - Cutoff of 0.1")
+p5
+p5_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne_normalized_na_cutoff_0.png")
+ggsave(p5_filename, p5, width = 10, height = 8)
+p6 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice, features = "GFP-TotalSeqC", reduction = "tsne", na_cutoff = 0.2), "GFP-TotalSeqC expression across cells - Post-normalization - Cutoff of 0.2")
+p6
+p6_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne_normalized_na_cutoff_10.png")
+ggsave(p6_filename, p6, width = 10, height = 8)
+```
+
+```{r}
+# Which cells does not express GFP-TotalSeqC? In non-normalized & normalized data.
+# Fetching data for GFP-TotalSeqC across all cells.
+gfp_expression <- FetchData(sc2atlas_mice, vars = "GFP-TotalSeqC", slot = "counts")
+gfp_expression
+gfp_expression_norm <- FetchData(sc2atlas_mice, vars = "GFP-TotalSeqC", slot = "data")
+gfp_expression_norm
+# Change the name of the column.
+colnames(gfp_expression) <- "GFP"
+colnames(gfp_expression_norm) <- "GFP"
+# Identifying cells with no GFP-TotalSeqC expression.
+cells_no_gfp <- rownames(gfp_expression[gfp_expression$GFP == 0, , drop = FALSE])
+cells_no_gfp_norm <- rownames(gfp_expression_norm[gfp_expression_norm$GFP == 0, , drop = FALSE])
+# Printing the cell (barcodes) with no GFP-TotalSeqC expression.
+cells_no_gfp
+cells_no_gfp_norm
+# Summary.
+summary(gfp_expression$GFP)
+summary(gfp_expression_norm$GFP)
+# How many cells express less than a set threshold of GFP-TotalSeqC?
+sum(gfp_expression$GFP < 10)
+sum(gfp_expression$GFP < 5)
+sum(gfp_expression_norm$GFP < 0.05)
+sum(gfp_expression_norm$GFP < 0.1)
+sum(gfp_expression_norm$GFP < 0.2)
+```
+
+9 cells from the Knaf4_En1Sun1GFPNeuN_CITEseq sample have an expression of GFP-TotalSeqC < 0.05. We will remove these cells from the dataset.
+Around 7 cells have an expression of GFP-TotalSeqC < 5 in the non-normalized data.
+
+```{r}
+# Add a column to the metadata indicating the expression of GFP-TotalSeqC.
+sc2atlas_mice <- AddMetaData(sc2atlas_mice, metadata = gfp_expression_norm, col.name = "GFP")
+# Remove cells from Knaf4_En1Sun1GFPNeuN_CITEseq where GFP < 0.05, keep all others.
+sc2atlas_mice <- subset(sc2atlas_mice, subset = GFP > 0.05 | orig.ident != "Knaf4_En1Sun1GFPNeuN_CITEseq")
+```
+
+```{r}
+# Save the filtered, normalized Seurat object.
+saveRDS(sc2atlas_mice, file = "sc2atlas_mice.rds")
+```
+
+```{r}
+# Clear the environment.
+rm(list = ls())
+# Load the filtered, normalized Seurat object.
+sc2atlas_mice <- readRDS("sc2atlas_mice.rds")
+```
+
+## 5. Clustering.
+```{r}
+# Switch back to the SCT assay.
+DefaultAssay(sc2atlas_mice) 
+DefaultAssay(sc2atlas_mice) <- "SCT"
+DefaultAssay(sc2atlas_mice)
+```
+
+```{r}
+# 5.1. Determine the PC optimal number to use for clustering : Elbow plot.
+p1 <- ElbowPlot(sc2atlas_mice, ndims = 50, reduction = "pca")
+st.dev <- sc2atlas_mice@reductions[["pca"]]@stdev  # Fit lines for elbow plot.
+coef1 <- coef(lm(y~x, data = data.frame(x = 20:25, y = st.dev[20:25])))
+coef2 <- coef(lm(y~x, data = data.frame(x = 25:30, y = st.dev[25:30])))
+p1 <- p1 + ggtitle("Elbow Plot") +
+  theme_gray(base_size = 18) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(face = "bold"),
+        axis.text.y = element_text(face = "bold")) + 
+  geom_vline(xintercept = 25, color = "firebrick") + 
+  geom_path(data = data.frame(x = 20:30, y = 20:30*coef1["x"] + coef1["(Intercept)"]), aes(x, y), color = "dodgerblue") + 
+  geom_path(data = data.frame(x = 20:30, y = 20:30*coef2["x"] + coef2["(Intercept)"]), aes(x, y), color = "dodgerblue")
+print(p1)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "elbow_plot_mice.png")
+ggsave(plot_filename, p1, width = 10, height = 8)
+```
+
+```{r}
+# 5.1. Determine the PC optimal number to use for clustering : Elbow plot.
+p1 <- ElbowPlot(neurons, ndims = 50, reduction = "pca")
+st.dev <- neurons@reductions[["pca"]]@stdev  # Fit lines for elbow plot.
+coef1 <- coef(lm(y~x, data = data.frame(x = 20:25, y = st.dev[20:25])))
+coef2 <- coef(lm(y~x, data = data.frame(x = 25:30, y = st.dev[25:30])))
+p1 <- p1 + ggtitle("Elbow Plot") +
+  theme_gray(base_size = 18) +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(face = "bold"),
+        axis.text.y = element_text(face = "bold")) + 
+  geom_vline(xintercept = 25, color = "firebrick") + 
+  geom_path(data = data.frame(x = 20:30, y = 20:30*coef1["x"] + coef1["(Intercept)"]), aes(x, y), color = "dodgerblue") + 
+  geom_path(data = data.frame(x = 20:30, y = 20:30*coef2["x"] + coef2["(Intercept)"]), aes(x, y), color = "dodgerblue")
+print(p1)
+plot_filename <- paste0("../neurons_mouse/knafo/", "elbow_plot_mice.png")
+ggsave(plot_filename, p1, width = 10, height = 8)
+```
+
+```{r}
+# 5.1.bis. Find significant PCs.
+# Extract the standard deviations of the principal components from the PCA results (the amount of variance each principal component captures).
+stdv <- sc2atlas_mice[["pca"]]@stdev
+# Calculate the total variance explained by all principal components.
+sum.stdv <- sum(sc2atlas_mice[["pca"]]@stdev)
+# Calculate the variance explained by each PC as a percentage of the total variance.
+percent.stdv <- (stdv/sum.stdv) * 100
+# Calculate the cumulative sum of the percentage variance explained by the principal components, to assess how many components are necessary to explain a significant portion of the variance in the data.
+cumulative <- cumsum(percent.stdv)
+# Find the first principal component that makes the cumulative variance exceed 90% while each individual component contributes less than 5% to the variance. = Common criterion for deciding how many components to retain — we want enough components to capture a large portion of the data variability without each component adding too little information.
+col1 <- which(cumulative > 90 & percent.stdv < 5)[1]
+# Search for the first major drop in the variance contribution from one component to the next, specifically where the drop is greater than 0.05%. This identifies a natural cut-off point where adding further components yields diminishing returns in terms of explained variance.
+col2 <- sort(which((percent.stdv[1:length(percent.stdv) - 1] - percent.stdv[2:length(percent.stdv)]) > 0.05), decreasing = T)[1] + 1  # Drop greater than 0.05%.
+# Minimum of both criteria.
+min.pc <- min(col1, col2)
+col1
+col2
+min.pc
+```
+
+```{r}
+stdv <- neurons[["pca"]]@stdev
+# Calculate the total variance explained by all principal components.
+sum.stdv <- sum(neurons[["pca"]]@stdev)
+# Calculate the variance explained by each PC as a percentage of the total variance.
+percent.stdv <- (stdv/sum.stdv) * 100
+# Calculate the cumulative sum of the percentage variance explained by the principal components, to assess how many components are necessary to explain a significant portion of the variance in the data.
+cumulative <- cumsum(percent.stdv)
+# Find the first principal component that makes the cumulative variance exceed 90% while each individual component contributes less than 5% to the variance. = Common criterion for deciding how many components to retain — we want enough components to capture a large portion of the data variability without each component adding too little information.
+col1 <- which(cumulative > 90 & percent.stdv < 5)[1]
+# Search for the first major drop in the variance contribution from one component to the next, specifically where the drop is greater than 0.05%. This identifies a natural cut-off point where adding further components yields diminishing returns in terms of explained variance.
+col2 <- sort(which((percent.stdv[1:length(percent.stdv) - 1] - percent.stdv[2:length(percent.stdv)]) > 0.05), decreasing = T)[1] + 1  # Drop greater than 0.05%.
+# Minimum of both criteria.
+min.pc <- min(col1, col2)
+col1
+col2
+min.pc
+```
+
+
+```{r}
+# 5.2. Identify clusters of cells by a shared nearest neighbor (SNN) modularity optimization based clustering algorithm. 
+# 5.2.A. Construct a KNN graph based on the euclidean distance in PCA space, and refine the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the FindNeighbors() function, and takes as input the previously defined dimensionality of the dataset (first 30 PCs).
+sc2atlas_mice <- FindNeighbors(sc2atlas_mice,
+                          reduction = "pca", # Reduction to use as input for building the SNN graph.
+                          dims = 1:25, # Dimensions of reduction to use for finding the nearest neighbors. 
+                          features = NULL, # Features to use as input for building the SNN graph; used when dims is NULL.
+                          k.param = 20, # Number of k-nearest neighbors.
+                          nn.method = "annoy", # Method for nearest neighbor finding. Options include: rann, annoy.
+                          annoy.metric = "euclidean") # Distance metric for annoy. Options include: euclidean, cosine, manhattan, and hamming.
+
+# 5.2.B. Apply a modularity optimization algorithm to identify clusters within the SNN graph.
+sc2atlas_mice <- FindClusters(sc2atlas_mice, 
+                         modularity.fxn = 1, # Modularity function (1 = standard; 2 = alternative).
+                         resolution = c(0.1, 0.3, 0.5, 0.7, 1, 1.5, 2), # Value of the resolution parameter. A value above (below) 1.0 it gives a larger (smaller) number of communities (clusters). 
+                         algorithm = 1) # Algorithm for modularity optimization. 1 = original Louvain algorithm; 2 = Louvain algorithm with multilevel refinement; 3 = SLM algorithm; 4 = Leiden algorithm.
+#view(sc2atlas_sct@meta.data)
+```
+
+```{r}
+neurons <- FindNeighbors(neurons,
+                          reduction = "pca", 
+                          dims = 1:30,  
+                          features = NULL,
+                          k.param = 20, 
+                          nn.method = "annoy", 
+                          annoy.metric = "euclidean") 
+
+# 5.2.B. Apply a modularity optimization algorithm to identify clusters within the SNN graph.
+neurons <- FindClusters(neurons, 
+                         modularity.fxn = 1,
+                         resolution = c(0.1, 0.3, 0.5, 0.7, 1, 1.5, 2),
+                         algorithm = 1)
+```
+
+
+```{r}
+neurons <- RunTSNE(neurons, reduction = "pca", dims = 1:30)
+neurons <- RunUMAP(neurons, reduction = "pca", dims = 1:30)
+```
+
+
+```{r}
+# 5.2.C. Visualize the determined clusters for each of the resolutions tested.
+# t-SNE.
+plots <- list()
+for (res in c(0.3, 0.5, 0.7, 1, 1.5, 2)) {
+    resolution_label <- paste0("SCT_snn_res.", res)
+    p <- DimPlot(sc2atlas_mice, group.by = resolution_label, label = TRUE, reduction = "tsne") + 
+         ggtitle(paste("Resolution", res))  
+    plots[[length(plots) + 1]] <- p
+}
+combined_plot <- wrap_plots(plots, ncol = 2)  
+combined_plot
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "resolutions_plots_tsne.png")
+ggsave(plot_filename, combined_plot, width = 20, height = 25)
+
+# UMAP.
+plots <- list()
+for (res in c(0.3, 0.5, 0.7, 1, 1.5, 2)) {
+    resolution_label <- paste0("SCT_snn_res.", res)
+    p <- DimPlot(sc2atlas_mice, group.by = resolution_label, label = TRUE, reduction = "umap") + 
+         ggtitle(paste("Resolution", res))  
+    plots[[length(plots) + 1]] <- p
+}
+combined_plot <- wrap_plots(plots, ncol = 2)
+combined_plot
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "resolutions_plots_umap.png")
+ggsave(plot_filename, combined_plot, width = 20, height = 25)
+```
+
+```{r}
+# 5.2.C. Visualize the determined clusters for each of the resolutions tested.
+# t-SNE.
+plots <- list()
+for (res in c(0.3, 0.5, 0.7, 1, 1.5, 2)) {
+    resolution_label <- paste0("SCT_snn_res.", res)
+    p <- DimPlot(neurons, group.by = resolution_label, label = TRUE, reduction = "tsne") + 
+         ggtitle(paste("Resolution", res))  
+    plots[[length(plots) + 1]] <- p
+}
+combined_plot <- wrap_plots(plots, ncol = 2)  
+combined_plot
+plot_filename <- paste0("../neurons_mouse/knafo/", "resolutions_plots_tsne.png")
+ggsave(plot_filename, combined_plot, width = 20, height = 25)
+
+# UMAP.
+plots <- list()
+for (res in c(0.3, 0.5, 0.7, 1, 1.5, 2)) {
+    resolution_label <- paste0("SCT_snn_res.", res)
+    p <- DimPlot(neurons, group.by = resolution_label, label = TRUE, reduction = "umap") + 
+         ggtitle(paste("Resolution", res))  
+    plots[[length(plots) + 1]] <- p
+}
+combined_plot <- wrap_plots(plots, ncol = 2)
+combined_plot
+plot_filename <- paste0("../neurons_mouse/knafo/", "resolutions_plots_umap.png")
+ggsave(plot_filename, combined_plot, width = 20, height = 25)
+```
+
+```{r}
+# 5.3. Determine the optimal resolution.
+#plot <- clustree(sc2atlas_mice, prefix = paste0("SCT", "_snn_res."))
+plot <- clustree(neurons, prefix = paste0("SCT", "_snn_res."))
+print(plot) 
+plot_filename <- paste0("../neurons_mouse/knafo/", "clustree_plot.png")
+ggsave(plot_filename, plot, width = 10, height = 8)
+```
+
+```{r}
+# 5.3.bis. Set the identity of cells to the identified clusters.
+#Idents(sc2atlas_mice) <- "SCT_snn_res.0.5" # Based on the clustree graph, resolution 1 was chosen as the optimal resolution.
+Idents(neurons) <- "SCT_snn_res.0.5"
+```
+
+```{r}
+# 5.4. Visualizations.
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+plot0 <- apply_theme(DimPlot(sc2atlas_mice, reduction = "pca"), "Cell clusters : Clustering on PCA space")
+print(plot0)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "PCA_clusters_plot.png")
+ggsave(plot_filename, plot0, width = 10, height = 8)
+plot1 <- apply_theme(DimPlot(sc2atlas_mice, reduction = "tsne"), "Cell clusters : Clustering on PCA space")
+print(plot1)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "tSNE_clusters_plot.png")
+ggsave(plot_filename, plot1, width = 10, height = 8)
+plot2 <- apply_theme(DimPlot(sc2atlas_mice, reduction = "umap"), "Cell clusters : Clustering on PCA space")
+print(plot2)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "UMAP_clusters_plot.png")
+ggsave(plot_filename, plot2, width = 10, height = 8)
+```
+
+```{r}
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+plot0 <- apply_theme(DimPlot(neurons, reduction = "pca"), "Cell clusters : Clustering on PCA space")
+print(plot0)
+plot_filename <- paste0("../neurons_mouse/knafo/", "PCA_clusters_plot.png")
+ggsave(plot_filename, plot0, width = 10, height = 8)
+#plot1 <- apply_theme(DimPlot(sc2atlas_mice, reduction = "tsne"), "Cell clusters : Clustering on PCA space")
+#print(plot1)
+#plot_filename <- paste0("../neurons_mouse/knafo/", "tSNE_clusters_plot.png")
+#ggsave(plot_filename, plot1, width = 10, height = 8)
+plot2 <- apply_theme(DimPlot(neurons, reduction = "umap"), "Cell clusters : Clustering on PCA space")
+print(plot2)
+plot_filename <- paste0("../neurons_mouse/knafo/", "UMAP_clusters_plot.png")
+ggsave(plot_filename, plot2, width = 10, height = 8)
+```
+```{r}
+# Set the identity of the neurons object to samples
+Idents(neurons) <- "orig.ident"
+
+plot <- apply_theme(DimPlot(neurons, reduction = "umap", group.by = "orig.ident", split.by = "orig.ident"), "Cells distribution per sample")
+print(plot)
+plot_filename <- paste0("../neurons_mouse/knafo/", "UMAP_samples_plot_split.png")
+ggsave(plot_filename, plot, width = 10, height = 8)
+
+plot1 <- apply_theme(DimPlot(neurons, reduction = "umap", group.by = "orig.ident"), "Cells distribution per sample")
+print(plot1)
+plot_filename <- paste0("../neurons_mouse/knafo/", "UMAP_samples_plot.png")
+ggsave(plot_filename, plot1, width = 10, height = 8)
+```
+
+Given the results, an integration of the data is necessary to remove the batch effect between the samples.
+First, we will join the two datasets Knaf3_En1Sun1NeuN and Knaf4_En1Sun1GFPNeuN_CITEseq since they correspond to the same sample.
+## 5.bis
+```{r}
+# 5.5. Join the two datasets Knaf3_En1Sun1NeuN and Knaf4_En1Sun1GFPNeuN_CITEseq.
+# Clean the environment.
+#rm(list = ls())
+# Load the list of the Seurat objects (knafo mice samples).
+obj.list <- readRDS(file = "../Rdata/knafo_objlist_annotated_dbl.rds")
+# Remove doublets.
+for (i in 1:length(obj.list)) {
+  obj.list[[i]] <- subset(obj.list[[i]], subset = doublet_finder == "Singlet")
+}
+
+# Extract the two datasets.
+knaf3 <- obj.list[["Knaf3_En1Sun1NeuN"]]
+knaf4 <- obj.list[["Knaf4_En1Sun1GFPNeuN_CITEseq"]]
+# Remove the two datasets from the list.
+obj.list[["Knaf3_En1Sun1NeuN"]] <- NULL
+obj.list[["Knaf4_En1Sun1GFPNeuN_CITEseq"]] <- NULL
+# Remove MACS samples.
+obj.list[["Knaf1_En1Sun1GFPNeuN"]] <- NULL
+obj.list[["Knaf2_En1SunGFPNeuN"]] <- NULL
+```
+
+```{r}
+BOUV <- obj.list[["BOUV5_M1_SC1_280421"]]
+```
+
+
+```{r}
+# Only neurons.
+#gsm_pattern <- grepl("GSM", names(obj.list))
+#obj.list <- obj.list[!gsm_pattern]
+```
+
+
+```{r}
+# ADT assay.
+DefaultAssay(knaf4) <- "antibody_counts"
+NormalizeADTData <- function(object, assay = NULL, verbose = TRUE) {
+  if (is.null(assay)) {
+    assay <- DefaultAssay(object)
+  }
+  # Accessing the counts data
+  counts <- GetAssayData(object = object[[assay]], slot = "counts")
+  # Ensure the data is unidimensional and is a matrix
+  if (is(counts, "Matrix") && nrow(counts) == 1) {
+    if (verbose) {
+      message("Applying CLR normalization on unidimensional assay data")
+    }
+    
+    # CLR normalization: Normalize the expression of each cell
+    # Calculate the geometric mean using non-zero values only
+    non_zero_counts <- counts[counts > 0]
+    geo_mean <- exp(sum(log1p(non_zero_counts)) / length(counts))
+    # Normalize counts
+    normalized_counts <- log1p(counts / geo_mean)
+    
+    # Updating the data slot with the normalized counts
+    object[[assay]] <- SetAssayData(
+      object = object[[assay]],
+      slot = "data",
+      new.data = Matrix::Matrix(normalized_counts, sparse = TRUE)
+    )
+  } else {
+    stop("Provided assay data is not unidimensional or is not a proper matrix type.")
+  }
+  
+  # Logging command for reproducibility
+  object <- LogSeuratCommand(object)
+  
+  return(object)
+}
+knaf4 <- NormalizeADTData(knaf4, assay = "antibody_counts")
+gfp_expression_norm <- FetchData(knaf4, vars = "GFP-TotalSeqC", slot = "data")
+knaf4 <- AddMetaData(knaf4, metadata = gfp_expression_norm, col.name = "GFP")
+knaf4 <- subset(knaf4, subset = GFP > 0.05)
+DefaultAssay(knaf4) <- "RNA"
+DefaultAssay(knaf4)
+```
+
+```{r}
+# Store the two datasets in a list.
+knaf3_4_list <- list(knaf3, knaf4)
+names(knaf3_4_list) <- c("Knaf3_En1Sun1NeuN", "Knaf4_En1Sun1GFPNeuN_CITEseq")
+
+# Merge the Seurat Objects for each one of the lists.
+samples_names <- names(obj.list)
+sc2atlas_mice_1 <- Merge_Seurat_List(obj.list, add.cell.ids = samples_names, project = "bouv")
+samples_names <- names(knaf3_4_list)
+sc2atlas_mice_2 <- Merge_Seurat_List(knaf3_4_list, add.cell.ids = samples_names, project = "knaf3-4")
+
+# Filtering.
+sc2atlas_mice_2[["percent_mito"]] <- PercentageFeatureSet(sc2atlas_mice_2, pattern = "^mt-")
+sc2atlas_mice_2 <- subset(sc2atlas_mice_2, subset = nFeature_RNA > 200 & percent_mito < 10)
+sc2atlas_mice_1[["percent_mito"]] <- PercentageFeatureSet(sc2atlas_mice_1, pattern = "^mt-")
+sc2atlas_mice_1 <- subset(sc2atlas_mice_1, subset = nFeature_RNA > 200 & percent_mito < 10)
+
+# Join the two datasets.
+sc2atlas_mice_2[["RNA"]] <- JoinLayers(sc2atlas_mice_2[["RNA"]])
+
+# Update sample identifiers in metadata.
+sc2atlas_mice_2$orig.ident[sc2atlas_mice_2$orig.ident %in% c("Knaf3_En1Sun1NeuN", "Knaf4_En1Sun1GFPNeuN_CITEseq")] <- "Knaf3-4_En1Sun1NeuN-GFPNeuNCITEseq"
+
+# Merge the two merged Seurat objects.
+sc2atlas_mice_combined <- merge(x = sc2atlas_mice_1, y = sc2atlas_mice_2)
+```
+
+```{r}
+# Preprocess the combined dataset.
+sc2atlas_mice_combined <- SCTransform(sc2atlas_mice_combined, vst.flavor = "v1")
+sc2atlas_mice_combined <- RunPCA(sc2atlas_mice_combined, nfeatures.print = 5)
+sc2atlas_mice_combined <- RunUMAP(sc2atlas_mice_combined, reduction = "pca", dims = 1:30)
+sc2atlas_mice_combined <- RunTSNE(sc2atlas_mice_combined, reduction = "pca", dims = 1:30)
+```
+
+```{r}
+BOUV <- SCTransform(BOUV, vst.flavor = "v1")
+BOUV <- RunPCA(BOUV, nfeatures.print = 5)
+stdv <- BOUV[["pca"]]@stdev
+sum.stdv <- sum(BOUV[["pca"]]@stdev)
+percent.stdv <- (stdv/sum.stdv) * 100
+cumulative <- cumsum(percent.stdv)
+col1 <- which(cumulative > 90 & percent.stdv < 5)[1]
+col2 <- sort(which((percent.stdv[1:length(percent.stdv) - 1] - percent.stdv[2:length(percent.stdv)]) > 0.05), decreasing = T)[1] + 1  
+min.pc <- min(col1, col2)
+col1
+col2
+min.pc
+```
+
+```{r}
+BOUV <- RunUMAP(BOUV, reduction = "pca", dims = 1:30)
+BOUV <- RunTSNE(BOUV, reduction = "pca", dims = 1:30)
+```
+
+
+```{r}
+stdv <- sc2atlas_mice_combined[["pca"]]@stdev
+sum.stdv <- sum(sc2atlas_mice_combined[["pca"]]@stdev)
+percent.stdv <- (stdv/sum.stdv) * 100
+cumulative <- cumsum(percent.stdv)
+col1 <- which(cumulative > 90 & percent.stdv < 5)[1]
+col2 <- sort(which((percent.stdv[1:length(percent.stdv) - 1] - percent.stdv[2:length(percent.stdv)]) > 0.05), decreasing = T)[1] + 1  
+min.pc <- min(col1, col2)
+col1
+col2
+min.pc
+```
+
+```{r}
+sc2atlas_mice_combined <- FindNeighbors(sc2atlas_mice_combined, reduction = "pca", dims = 1:26)
+sc2atlas_mice_combined <- FindClusters(sc2atlas_mice_combined, resolution = 0.5)
+```
+
+```{r}
+# Plot t-SNE and UMAP.
+# order = c("Knaf1_En1Sun1GFPNeuN", "Knaf2_En1Sun1GFPNeuN", "Knaf3-4_En1Sun1NeuN-GFPNeuNCITEseq", "Kathe_GSM5585219", "Kathe_GSM5585220", "Kathe_GSM5585221", "Mantson_GSM5243301", "Mantson_GSM5243302", "Mantson_GSM5243303")
+
+order = c("BOUV5_M1_SC1_280421", "Knaf3-4_En1Sun1NeuN-GFPNeuNCITEseq")
+inverse_order = rev(order)
+
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+
+# UMAP.
+plot1 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "umap", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample in UMAP space")
+print(plot1)
+plot1_filename <- paste0("../sc2atlas_mouse/knafo/", "umap_plot_sct_mice_combined.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+
+plot2 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "umap", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample in UMAP space")
+print(plot2)
+plot2_filename <- paste0("../sc2atlas_mouse/knafo/", "umap_plot_sct_mice_combined_split.png")
+ggsave(plot2_filename, plot2, width = 20, height = 10)
+
+# t-SNE.
+plot3 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "tsne", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample in t-SNE space")
+print(plot3)
+plot3_filename <- paste0("../sc2atlas_mouse/knafo/", "tsne_plot_sct_mice_combined.png")
+ggsave(plot3_filename, plot3, width = 10, height = 8)
+
+plot4 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "tsne", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample in t-SNE space")
+print(plot4)
+plot4_filename <- paste0("../sc2atlas_mouse/knafo/", "tsne_plot_sct_mice_combined_split.png")
+ggsave(plot4_filename, plot4, width = 20, height = 10)
+```
+
+```{r}
+# Plot t-SNE and UMAP.
+order = c("Knaf1_En1Sun1GFPNeuN", "Knaf2_En1Sun1GFPNeuN", "Knaf3-4_En1Sun1NeuN-GFPNeuNCITEseq")
+inverse_order = rev(order)
+
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+
+# UMAP.
+plot1 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "umap", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample in UMAP space")
+print(plot1)
+plot1_filename <- paste0("neurons", "/umap_plot_sct_mice_combined.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+
+plot2 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "umap", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample in UMAP space")
+print(plot2)
+plot2_filename <- paste0("neurons", "/umap_plot_sct_mice_combined_split.png")
+ggsave(plot2_filename, plot2, width = 20, height = 10)
+
+# t-SNE.
+plot3 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "tsne", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample in t-SNE space")
+print(plot3)
+plot3_filename <- paste0("neurons", "/tsne_plot_sct_mice_combined.png")
+ggsave(plot3_filename, plot3, width = 10, height = 8)
+
+plot4 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "tsne", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample in t-SNE space")
+print(plot4)
+plot4_filename <- paste0("neurons", "/tsne_plot_sct_mice_combined_split.png")
+ggsave(plot4_filename, plot4, width = 20, height = 10)
+```
+
+```{r}
+# Visualize the expression of the GFP-TotalSeqC feature after normalization.
+# UMAP
+p1 <- apply_theme(FeaturePlot(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "umap"), "GFP-TotalSeqC expression across cells - Post-normalization")
+p1
+p1_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_umap_normalized_knafo.png")
+ggsave(p1_filename, p1, width = 10, height = 8)
+p2 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "umap", na_cutoff = 0), "GFP-TotalSeqC expression across cells - Post-normalization")
+p2
+p2_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_umap_normalized_na_cutoff_0_knafo.png")
+ggsave(p2_filename, p2, width = 10, height = 8)
+
+# t-SNE
+p4 <- apply_theme(FeaturePlot(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "tsne"), "GFP-TotalSeqC expression across cells - Post-normalization")
+p4
+p4_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne_normalized_knafo.png")
+ggsave(p4_filename, p4, width = 10, height = 8)
+p5 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "tsne", na_cutoff = 0), "GFP-TotalSeqC expression across cells - Post-normalization")
+p5
+p5_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne_normalized_na_cutoff_0_knafo.png")
+ggsave(p5_filename, p5, width = 10, height = 8)
+
+# Plot gene expression in 2D space.
+# UMAP
+p1 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "nFeature_SCT", reduction = "umap"), "Gene expression landscape across cells")
+p1
+p1_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_nFeature_SCT_umap_knafo.png")
+ggsave(p1_filename, p1, width = 10, height = 8)
+# Neurons have around 5k expressed genes, whereas the other nervous system types of cells have around 3k expressed genes.
+# t-SNE.
+p2 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "nFeature_SCT", reduction = "tsne"), "Gene expression landscape across cells")
+p2
+p2_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_nFeature_SCT_tsne_knafo.png")
+ggsave(p2_filename, p2, width = 10, height = 8)
+```
+
+
+```{r}
+# Visualize the expression of the GFP-TotalSeqC feature after normalization.
+# UMAP
+p1 <- apply_theme(FeaturePlot(neurons, features = "GFP-TotalSeqC", reduction = "umap"), "GFP-TotalSeqC expression across neurons - Post-normalization")
+p1
+p1_filename <- paste0("../neurons_mouse/knafo/", "feature_plot_gfp_umap_normalized_knafo.png")
+ggsave(p1_filename, p1, width = 10, height = 8)
+p2 <- apply_theme(FeaturePlot_scCustom(neurons, features = "GFP-TotalSeqC", reduction = "umap", na_cutoff = 0), "GFP-TotalSeqC expression across neurons - Post-normalization")
+p2
+p2_filename <- paste0("../neurons_mouse/knafo/", "feature_plot_gfp_umap_normalized_na_cutoff_0_knafo.png")
+ggsave(p2_filename, p2, width = 10, height = 8)
+
+# t-SNE
+#p4 <- apply_theme(FeaturePlot(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "tsne"), "GFP-TotalSeqC expression across cells - Post-normalization")
+#p4
+#p4_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne_normalized_knafo.png")
+#ggsave(p4_filename, p4, width = 10, height = 8)
+#p5 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "tsne", na_cutoff = 0), "GFP-TotalSeqC expression across cells - Post-normalization")
+#p5
+#p5_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne_normalized_na_cutoff_0_knafo.png")
+#ggsave(p5_filename, p5, width = 10, height = 8)
+
+# Plot gene expression in 2D space.
+# UMAP
+p1 <- apply_theme(FeaturePlot_scCustom(neurons, features = "nFeature_SCT", reduction = "umap"), "Gene expression landscape across neurons")
+p1
+p1_filename <- paste0("../neurons_mouse/knafo/", "feature_plot_nFeature_SCT_umap_knafo.png")
+ggsave(p1_filename, p1, width = 10, height = 8)
+# Neurons have around 5k expressed genes, whereas the other nervous system types of cells have around 3k expressed genes.
+# t-SNE.
+#p2 <- apply_theme(FeaturePlot_scCustom(neurons, features = "nFeature_SCT", reduction = "tsne"), "Gene expression landscape neurons cells")
+#p2
+#p2_filename <- paste0("../neurons_mouse/knafo/", "feature_plot_nFeature_SCT_tsne_knafo.png")
+#ggsave(p2_filename, p2, width = 10, height = 8)
+```
+
+
+```{r}
+# Visualize the clusters.
+Idents(neurons) <- "SCT_snn_res.0.5"
+
+# PCA.
+plot1 <- apply_theme(DimPlot_scCustom(neurons, reduction = "pca"), "Neurons clusters : Clustering applied on PCA space")
+print(plot1)
+plot_filename <- paste0("../neurons_mouse/knafo/", "PCA_clusters_plot_combined_mice.png")
+ggsave(plot_filename, plot1, width = 10, height = 8)
+
+# t-SNE.
+#plot2 <- apply_theme(DimPlot_scCustom(neurons, reduction = "tsne"), "Cell clusters : Clustering applied on PCA space")
+#print(plot2)
+#plot_filename <- paste0("../sc2atlas_mouse/knafo/", "tSNE_clusters_plot_combined_mice.png")
+#ggsave(plot_filename, plot2, width = 10, height = 8)
+
+# UMAP.
+plot3 <- apply_theme(DimPlot_scCustom(neurons, reduction = "umap"), "Neruons clusters : Clustering applied on PCA space")
+print(plot3)
+plot_filename <- paste0("../neurons_mouse/knafo/", "UMAP_clusters_plot_combined_mice.png")
+ggsave(plot_filename, plot3, width = 10, height = 8)
+```
+
+
+
+```{r}
+# Visualize the clusters.
+Idents(sc2atlas_mice_combined) <- "SCT_snn_res.0.5"
+
+# PCA.
+plot1 <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "pca"), "Cell clusters : Clustering applied on PCA space")
+print(plot1)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "PCA_clusters_plot_combined_mice.png")
+ggsave(plot_filename, plot1, width = 10, height = 8)
+
+# t-SNE.
+plot2 <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "tsne"), "Cell clusters : Clustering applied on PCA space")
+print(plot2)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "tSNE_clusters_plot_combined_mice.png")
+ggsave(plot_filename, plot2, width = 10, height = 8)
+
+# UMAP.
+plot3 <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "umap"), "Cell clusters : Clustering applied on PCA space")
+print(plot3)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "UMAP_clusters_plot_combined_mice.png")
+ggsave(plot_filename, plot3, width = 10, height = 8)
+```
+
+We can see that some clusters are mixed with cells from other clusters. This is observed in all the resolutions tested.
+Instead of applying FindNeighbors (which builds the SNN graph) and FindClusters (which runs community detection on that graph) on the PCA space, we will apply them on the UMAP and t-SNE spaces.
+```{r}
+# Apply FindNeighbors and FindClusters on the UMAP space.
+sc2atlas_mice_combined <- FindNeighbors(sc2atlas_mice_combined, reduction = "umap", dims = 1:2, force.recalc = T)
+sc2atlas_mice_combined <- FindClusters(sc2atlas_mice_combined, resolution = 0.1)
+Idents(sc2atlas_mice_combined) <- "SCT_snn_res.0.1"
+plot <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "umap"), "Cell clusters : Clustering applied on UMAP space")
+print(plot)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "UMAP_clusters_plot_umap_space_clusters.png")
+ggsave(plot_filename, plot, width = 10, height = 8)
+
+# Apply FindNeighbors and FindClusters on the t-SNE space.
+#sc2atlas_mice_combined <- FindNeighbors(sc2atlas_mice_combined, reduction = "tsne", dims = 1:2, force.recalc = T)
+#sc2atlas_mice_combined <- FindClusters(sc2atlas_mice_combined, resolution = 0.0574)
+#Idents(sc2atlas_mice_combined) <- "SCT_snn_res.0.0574"
+#plot <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "tsne"), "Cell clusters : Clustering applied on t-SNE space")
+#print(plot)
+#plot_filename <- paste0("../sc2atlas_mouse/knafo/", "tSNE_clusters_plot_tsne_space_clusters.png")
+#ggsave(plot_filename, plot, width = 10, height = 8)
+
+Idents(sc2atlas_mice_combined) <- "orig.ident"
+```
+
+```{r}
+# Apply FindNeighbors and FindClusters on the UMAP space.
+neurons <- FindNeighbors(neurons, reduction = "umap", dims = 1:2, force.recalc = T)
+neurons <- FindClusters(neurons, resolution = 0.1)
+Idents(neurons) <- "SCT_snn_res.0.1"
+plot <- apply_theme(DimPlot_scCustom(neurons, reduction = "umap"), "Neurons clusters : Clustering applied on UMAP space")
+print(plot)
+plot_filename <- paste0("../neurons_mouse/knafo/", "UMAP_clusters_plot_umap_space_clusters.png")
+ggsave(plot_filename, plot, width = 10, height = 8)
+
+# Apply FindNeighbors and FindClusters on the t-SNE space.
+#sc2atlas_mice_combined <- FindNeighbors(sc2atlas_mice_combined, reduction = "tsne", dims = 1:2, force.recalc = T)
+#sc2atlas_mice_combined <- FindClusters(sc2atlas_mice_combined, resolution = 0.0574)
+#Idents(sc2atlas_mice_combined) <- "SCT_snn_res.0.0574"
+#plot <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "tsne"), "Cell clusters : Clustering applied on t-SNE space")
+#print(plot)
+#plot_filename <- paste0("neurons", "/tSNE_clusters_plot_tsne_space_clusters.png")
+#ggsave(plot_filename, plot, width = 10, height = 8)
+```
+
+
+```{r}
+Idents(neurons) <- "orig.ident"
+```
+
+```{r}
+# Save the filtered, normalized Seurat object.
+#saveRDS(sc2atlas_mice_combined, file = "sc2atlas_mice_combined.rds")
+```
+
+```{r}
+# Clear the environment.
+rm(list = ls())
+# Reload the filtered, normalized Seurat object.
+sc2atlas_mice_combined <- readRDS("sc2atlas_mice_combined.rds")
+```
+
+## 6. Integration.
+```{r}
+# 6.1. Anchors-based RPCA integration.
+# Integrate datasets.
+sc2atlas_mice_combined <- IntegrateLayers(sc2atlas_mice_combined, method = RPCAIntegration, orig.reduction = "pca", new.reduction = "integrated.rpca", normalization.method = "SCT")
+sc2atlas_mice_combined <- RunTSNE(sc2atlas_mice_combined, reduction = "integrated.rpca", dims = 1:26, reduction.name = "tsne.rpca")
+sc2atlas_mice_combined <- RunUMAP(sc2atlas_mice_combined, reduction = "integrated.rpca", dims = 1:26, reduction.name = "umap.rpca")
+```
+
+```{r}
+# 6.1. Anchors-based RPCA integration.
+# Integrate datasets.
+neurons <- IntegrateLayers(neurons, method = RPCAIntegration, orig.reduction = "pca", new.reduction = "integrated.rpca", normalization.method = "SCT")
+neurons <- RunTSNE(neurons, reduction = "integrated.rpca", dims = 1:30, reduction.name = "tsne.rpca")
+neurons <- RunUMAP(neurons, reduction = "integrated.rpca", dims = 1:30, reduction.name = "umap.rpca")
+```
+
+```{r}
+# Visualizations.
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+#order = c("Knaf1_En1Sun1GFPNeuN", "Knaf2_En1Sun1GFPNeuN", "Knaf3-4_En1Sun1NeuN-GFPNeuNCITEseq", "Kathe_GSM5585219", "Kathe_GSM5585220", "Kathe_GSM5585221", "Mantson_GSM5243301", "Mantson_GSM5243302", "Mantson_GSM5243303")
+order = c("BOUV5_M1_SC1_280421", "Knaf3-4_En1Sun1NeuN-GFPNeuNCITEseq")
+inverse_order = rev(order)
+
+# t-SNE.
+#plot1 <- apply_theme(DimPlot(neurons, reduction = "tsne.rpca", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (RPCA)")
+#plot1
+#plot1_filename <- paste0("../neurons_mouse/knafo/", "tsne_plot_sct_mice_combined_rpca.png")
+#ggsave(plot1_filename, plot1, width = 10, height = 8)
+#plot2 <- apply_theme(DimPlot(neurons, reduction = "tsne.rpca", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (RPCA)")
+#plot2
+#plot2_filename <- paste0("../neurons_mouse/knafo/", "tsne_plot_sct_mice_combined_split_rpca.png")
+#ggsave(plot2_filename, plot2, width = 20, height = 10)
+
+# UMAP.
+plot1 <- apply_theme(DimPlot(neurons, reduction = "umap.rpca", group.by = "orig.ident", order = inverse_order), "Neurons distribution per sample - Post-integration (RPCA)")
+plot1
+plot1_filename <- paste0("../neurons_mouse/knafo/", "umap_plot_sct_mice_combined_rpca.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+plot2 <- apply_theme(DimPlot(neurons, reduction = "umap.rpca", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Neurons distribution per sample - Post-integration (RPCA)")
+plot2
+plot2_filename <- paste0("../neurons_mouse/knafo/", "umap_plot_sct_mice_combined_split_rpca.png")
+ggsave(plot2_filename, plot2, width = 20, height = 10)
+```
+
+```{r}
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+
+order = c("BOUV5_M1_SC1_280421", "Knaf3-4_En1Sun1NeuN-GFPNeuNCITEseq")
+inverse_order = rev(order)
+
+# t-SNE.
+plot1 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "tsne.rpca", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (RPCA)")
+plot1
+plot1_filename <- paste0("../sc2atlas_mouse/knafo/", "tsne_plot_sct_mice_combined_rpca.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+plot2 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "tsne.rpca", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (RPCA)")
+plot2
+plot2_filename <- paste0("../sc2atlas_mouse/knafo/", "tsne_plot_sct_mice_combined_split_rpca.png")
+ggsave(plot2_filename, plot2, width = 20, height = 10)
+
+# UMAP.
+plot1 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "umap.rpca", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (RPCA)")
+plot1
+plot1_filename <- paste0("../sc2atlas_mouse/knafo/", "umap_plot_sct_mice_combined_rpca.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+plot2 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "umap.rpca", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (RPCA)")
+plot2
+plot2_filename <- paste0("../sc2atlas_mouse/knafo/", "umap_plot_sct_mice_combined_split_rpca.png")
+ggsave(plot2_filename, plot2, width = 20, height = 10)
+```
+
+```{r}
+# 6.2. Anchor-based CCA integration.
+# Integrate datasets.
+sc2atlas_mice_combined <- IntegrateLayers(sc2atlas_mice_combined, method = CCAIntegration, orig.reduction = "pca", new.reduction = "integrated.cca", normalization.method = "SCT")
+sc2atlas_mice_combined <- RunTSNE(sc2atlas_mice_combined, reduction = "integrated.cca", dims = 1:25, reduction.name = "tsne.cca")
+sc2atlas_mice_combined <- RunUMAP(sc2atlas_mice_combined, reduction = "integrated.cca", dims = 1:25, reduction.name = "umap.cca")
+```
+
+```{r}
+# Visualizations.
+# t-SNE.
+plot1 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "tsne.cca", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (CCA)")
+plot1
+plot1_filename <- paste0("sc2atlas", "/tsne_plot_sct_mice_combined_cca.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+plot2 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "tsne.cca", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (CCA)")
+plot2
+plot2_filename <- paste0("sc2atlas", "/tsne_plot_sct_mice_combined_cca_split.png")
+ggsave(plot2_filename, plot2, width = 20, height = 10)
+
+# UMAP.
+plot1 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "umap.cca", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (CCA)")
+plot1
+plot1_filename <- paste0("sc2atlas", "/umap_plot_sct_mice_combined_cca.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+plot2 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "umap.cca", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (CCA)")
+plot2
+plot2_filename <- paste0("sc2atlas", "/umap_plot_sct_mice_combined_split_cca.png")
+ggsave(plot2_filename, plot2, width = 20, height = 10)
+```
+
+```{r}
+# 6.3. Harmony.
+sc2atlas_mice_combined <- IntegrateLayers(sc2atlas_mice_combined, method = HarmonyIntegration, orig.reduction = "pca", new.reduction = "harmony")
+sc2atlas_mice_combined <- RunTSNE(sc2atlas_mice_combined, reduction = "harmony", dims = 1:25, reduction.name = "tsne.harmony")
+sc2atlas_mice_combined <- RunUMAP(sc2atlas_mice_combined, reduction = "harmony", dims = 1:25, reduction.name = "umap.harmony")
+```
+
+```{r}
+# Visualizations.
+# t-SNE.
+plot1 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "tsne.harmony", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (Harmony)")
+plot1
+plot1_filename <- paste0("sc2atlas", "/tsne_plot_sct_mice_combined_harmony.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+
+plot2 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "tsne.harmony", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (Harmony)")
+plot2
+plot2_filename <- paste0("sc2atlas", "/tsne_plot_sct_mice_combined_harmony_split.png")
+ggsave(plot2_filename, plot2, width = 20, height = 10)
+
+# UMAP.
+plot3 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "umap.harmony", group.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (Harmony)")
+plot3
+plot3_filename <- paste0("sc2atlas", "/umap_plot_sct_mice_combined_harmony.png")
+ggsave(plot3_filename, plot3, width = 10, height = 8)
+
+plot4 <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "umap.harmony", group.by = "orig.ident", split.by = "orig.ident", order = inverse_order), "Cells distribution per sample - Post-integration (Harmony)")
+plot4
+plot4_filename <- paste0("sc2atlas", "/umap_plot_sct_mice_combined_harmony_split.png")
+ggsave(plot4_filename, plot4, width = 20, height = 10)
+```
+
+```{r}
+# Visualize the expression of the GFP-TotalSeqC feature after integration.
+# RPCA.
+# UMAP.
+p1 <- apply_theme(FeaturePlot(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "umap.rpca"), "GFP-TotalSeqC expression across cells - Post-integration (RPCA)")
+p1
+p1_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_umap_rpca.png")
+ggsave(p1_filename, p1, width = 10, height = 8)
+p2 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "umap.rpca", na_cutoff = 0), "GFP-TotalSeqC expression across cells - Post-integration (RPCA)")
+p2
+p2_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_umap_rpca_scustom.png")
+ggsave(p2_filename, p2, width = 10, height = 8)
+```
+
+```{r}
+# t-SNE.
+p3 <- apply_theme(FeaturePlot(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "tsne.rpca"), "GFP-TotalSeqC expression across cells - Post-integration (RPCA)")
+p3
+p3_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne_rpca.png")
+ggsave(p2_filename, p3, width = 10, height = 8)
+p4 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "tsne.rpca", na_cutoff = 0), "GFP-TotalSeqC expression across cells - Post-integration (RPCA)")
+p4
+p4_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_gfp_tsne_rpca_scustom.png")
+ggsave(p4_filename, p4, width = 10, height = 8)
+```
+
+```{r}
+# Harmony.
+# UMAP.
+p3 <- apply_theme(FeaturePlot(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "umap.harmony"), "GFP-TotalSeqC expression across cells - Post-integration (Harmony)")
+p3
+p3_filename <- paste0("sc2atlas", "/feature_plot_gfp_umap_harmony.png")
+ggsave(p3_filename, p3, width = 10, height = 8)
+p4 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "umap.harmony", na_cutoff = 0), "GFP-TotalSeqC expression across cells - Post-integration (Harmony)")
+p4
+p4_filename <- paste0("sc2atlas", "/feature_plot_gfp_umap_harmony_scustom.png")
+ggsave(p4_filename, p4, width = 10, height = 8)
+
+# t-SNE.
+p5 <- apply_theme(FeaturePlot(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "tsne.harmony"), "GFP-TotalSeqC expression across cells - Post-integration (Harmony)")
+p5
+p5_filename <- paste0("sc2atlas", "/feature_plot_gfp_tsne_harmony.png")
+ggsave(p5_filename, p5, width = 10, height = 8)
+p6 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "tsne.harmony", na_cutoff = 0), "GFP-TotalSeqC expression across cells - Post-integration (Harmony)")
+p6
+p6_filename <- paste0("sc2atlas", "/feature_plot_gfp_tsne_harmony_scustom.png")
+ggsave(p6_filename, p6, width = 10, height = 8)
+```
+
+```{r}
+# Visualize the expression of the GFP-TotalSeqC feature after integration.
+# RPCA.
+# UMAP.
+plot1 <- apply_theme(FeaturePlot(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "umap.rpca"), "GFP-TotalSeqC expression across cells - Post-integration (RPCA)")
+plot1
+p1_filename <- paste0("neurons", "/feature_plot_gfp_umap_rpca.png")
+ggsave(p1_filename, plot1, width = 10, height = 8)
+
+plot2 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "umap.rpca", na_cutoff = 0), "GFP-TotalSeqC expression across cells - Post-integration (RPCA)")
+plot2
+p2_filename <- paste0("neurons", "/feature_plot_gfp_umap_rpca_scustom.png")
+ggsave(p2_filename, plot2, width = 10, height = 8)
+
+# t-SNE.
+plot3 <- apply_theme(FeaturePlot(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "tsne.rpca"), "GFP-TotalSeqC expression across cells - Post-integration (RPCA)")
+plot3
+p3_filename <- paste0("neurons", "/feature_plot_gfp_tsne_rpca.png")
+ggsave(p2_filename, plot3, width = 10, height = 8)
+plot4 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "GFP-TotalSeqC", reduction = "tsne.rpca", na_cutoff = 0), "GFP-TotalSeqC expression across cells - Post-integration (RPCA)")
+plot4
+p4_filename <- paste0("neurons", "/feature_plot_gfp_tsne_rpca_scustom.png")
+ggsave(p4_filename, plot4, width = 10, height = 8)
+```
+
+```{r}
+# Visualize the expression of the GFP-TotalSeqC feature after integration.
+# RPCA.
+# UMAP.
+plot1 <- apply_theme(FeaturePlot(neurons, features = "GFP-TotalSeqC", reduction = "umap.rpca"), "GFP-TotalSeqC expression across neurons - Post-integration (RPCA)")
+plot1
+p1_filename <- paste0("../neurons_mouse/knafo/", "feature_plot_gfp_umap_rpca.png")
+ggsave(p1_filename, plot1, width = 10, height = 8)
+
+plot2 <- apply_theme(FeaturePlot_scCustom(neurons, features = "GFP-TotalSeqC", reduction = "umap.rpca", na_cutoff = 0), "GFP-TotalSeqC expression across neurons - Post-integration (RPCA)")
+plot2
+p2_filename <- paste0("../neurons_mouse/knafo/", "feature_plot_gfp_umap_rpca_scustom.png")
+ggsave(p2_filename, plot2, width = 10, height = 8)
+
+```
+
+
+```{r}
+# Plot gene expression in 2D space.
+# RPCA.
+# UMAP.
+p1 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "nFeature_SCT", reduction = "umap.rpca"), "Gene expression landscape across cells - Post-integration (RPCA)")
+# Neurons have around 5k expressed genes, whereas the other nervous system types of cells have around 3k expressed genes.
+p1
+p1_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_nFeature_SCT_umap_rpca.png")
+ggsave(p1_filename, p1, width = 10, height = 8)
+
+# t-SNE.
+#p2 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "nFeature_SCT", reduction = "tsne.rpca"), "Gene expression landscape across cells - Post-integration (RPCA)")
+#p2
+#p2_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_nFeature_SCT_tsne_rpca.png")
+#ggsave(p2_filename, p2, width = 10, height = 8)
+```
+
+```{r}
+# Plot gene expression in 2D space.
+# RPCA.
+# UMAP.
+p1 <- apply_theme(FeaturePlot_scCustom(neurons, features = "nFeature_SCT", reduction = "umap.rpca"), "Gene expression landscape across neurons - Post-integration (RPCA)")
+# Neurons have around 5k expressed genes, whereas the other nervous system types of cells have around 3k expressed genes.
+p1
+p1_filename <- paste0("../neurons_mouse/knafo/", "feature_plot_nFeature_SCT_umap_rpca.png")
+ggsave(p1_filename, p1, width = 10, height = 8)
+
+# t-SNE.
+#p2 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "nFeature_SCT", reduction = "tsne.rpca"), "Gene expression landscape across cells - Post-integration (RPCA)")
+#p2
+#p2_filename <- paste0("../sc2atlas_mouse/knafo/", "feature_plot_nFeature_SCT_tsne_rpca.png")
+#ggsave(p2_filename, p2, width = 10, height = 8)
+```
+
+
+```{r}
+# Harmony.
+# UMAP.
+p3 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "nFeature_SCT", reduction = "umap.harmony"), "Gene expression landscape across cells - Post-integration (Harmony)")
+p3
+p3_filename <- paste0("sc2atlas", "/feature_plot_nFeature_SCT_umap_harmony.png")
+ggsave(p3_filename, p3, width = 10, height = 8)
+# t-SNE.
+p4 <- apply_theme(FeaturePlot_scCustom(sc2atlas_mice_combined, features = "nFeature_SCT", reduction = "tsne.harmony"), "Gene expression landscape across cells - Post-integration (Harmony)")
+p4
+p4_filename <- paste0("sc2atlas", "/feature_plot_nFeature_SCT_tsne_harmony.png")
+ggsave(p4_filename, p4, width = 10, height = 8)
+```
+
+## 7. Perform clustering on integrated data.
+```{r}
+# Perform clustering on integrated dataset.
+# Test different resolutions.
+sc2atlas_mice_combined <- FindNeighbors(sc2atlas_mice_combined, reduction = "integrated.rpca", dims = 1:26)
+sc2atlas_mice_combined <- FindClusters(sc2atlas_mice_combined, resolution = c(0.1, 0.3, 0.5, 0.7, 1, 1.5, 2))
+```
+
+```{r}
+neurons <- FindNeighbors(neurons, reduction = "integrated.rpca", dims = 1:30)
+neurons <- FindClusters(neurons, resolution = c(0.1, 0.3, 0.5, 0.7, 1, 1.5, 2))
+```
+
+```{r}
+#sc2atlas_mice_combined@meta.data
+neurons@meta.data
+```
+
+```{r}
+columns_to_remove <- grep("SCT_snn_res", names(sc2atlas_mice_combined@meta.data), value = TRUE)
+columns_to_remove 
+sc2atlas_mice_combined@meta.data[columns_to_remove] <- list(NULL)
+sc2atlas_mice_combined@meta.data
+```
+
+```{r}
+columns_to_remove <- grep("SCT_snn_res", names(neurons@meta.data), value = TRUE)
+columns_to_remove 
+neurons@meta.data[columns_to_remove] <- list(NULL)
+neurons@meta.data
+```
+
+```{r}
+# Determine the optimal resolution.
+#plot <- clustree(sc2atlas_mice_combined, prefix = paste0("SCT", "_snn_res."))
+plot <- clustree(neurons, prefix = paste0("SCT", "_snn_res."))
+print(plot) 
+plot_filename <- paste0("../neurons_mouse/knafo/", "clustree_plot_rpca.png")
+ggsave(plot_filename, plot, width = 10, height = 8)
+```
+
+```{r}
+# Visualizations.
+# UMAP.
+Idents(sc2atlas_mice_combined) <- "SCT_snn_res.0.5"
+plot1 <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "umap.rpca"), "Neurons clusters - Post-integration (RPCA)")
+plot1
+plot1_filename <- paste0("../sc2atlas_mouse/knafo/", "UMAP_clusters_plot_combined_mice_rpca.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+
+# t-SNE.
+#plot2 <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "tsne.rpca"), "Cell clusters - Post-integration (RPCA)")
+#plot2
+#plot2_filename <- paste0("../sc2atlas_mouse/knafo/", "tSNE_clusters_plot_combined_mice_rpca.png")
+#ggsave(plot2_filename, plot2, width = 10, height = 8)
+```
+
+```{r}
+Idents(neurons) <- "SCT_snn_res.0.5"
+plot1 <- apply_theme(DimPlot_scCustom(neurons, reduction = "umap.rpca"), "Cell clusters - Post-integration (RPCA)")
+plot1
+plot1_filename <- paste0("../neurons_mouse/knafo/", "UMAP_clusters_plot_combined_mice_rpca.png")
+ggsave(plot1_filename, plot1, width = 10, height = 8)
+```
+
+
+Apply FindNeighbors and FindClusters on RPCA.UMAP and RPCA.t-SNE bidimensional space.
+```{r}
+# Apply FindNeighbors and FindClusters on the UMAP space.
+sc2atlas_mice_combined <- FindNeighbors(sc2atlas_mice_combined, reduction = "umap.rpca", dims = 1:2, force.recalc = T)
+sc2atlas_mice_combined <- FindClusters(sc2atlas_mice_combined, resolution = 0.1)
+Idents(sc2atlas_mice_combined) <- "SCT_snn_res.0.1"
+plot <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "umap.rpca"), "Cell clusters - Post-integration (RPCA)")
+print(plot)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "UMAP_clusters_plot_umap_rpca_space_clusters.png")
+ggsave(plot_filename, plot, width = 10, height = 8)
+
+# Apply FindNeighbors and FindClusters on the t-SNE space.
+#sc2atlas_mice_combined <- FindNeighbors(sc2atlas_mice_combined, reduction = "tsne.rpca", dims = 1:2, force.recalc = T)
+#sc2atlas_mice_combined <- FindClusters(sc2atlas_mice_combined, resolution = 0.07)
+#Idents(sc2atlas_mice_combined) <- "SCT_snn_res.0.07"
+#plot <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "tsne.rpca"), "Cell clusters - Post-integration (RPCA)")
+#print(plot)
+#plot_filename <- paste0("sc2atlas", "/tSNE_clusters_plot_tsne_rpca_space_clusters.png")
+#ggsave(plot_filename, plot, width = 10, height = 8)
+
+Idents(sc2atlas_mice_combined) <- "orig.ident"
+```
+
+
+```{r}
+# Apply FindNeighbors and FindClusters on the UMAP space.
+neurons <- FindNeighbors(neurons, reduction = "umap.rpca", dims = 1:2, force.recalc = T)
+neurons <- FindClusters(neurons, resolution = 0.1)
+Idents(neurons) <- "SCT_snn_res.0.1"
+plot <- apply_theme(DimPlot_scCustom(neurons, reduction = "umap.rpca"), "Neurons clusters - Post-integration (RPCA)")
+print(plot)
+plot_filename <- paste0("../neurons_mouse/knafo/", "UMAP_clusters_plot_umap_rpca_space_clusters.png")
+ggsave(plot_filename, plot, width = 10, height = 8)
+
+# Apply FindNeighbors and FindClusters on the t-SNE space.
+#sc2atlas_mice_combined <- FindNeighbors(sc2atlas_mice_combined, reduction = "tsne.rpca", dims = 1:2, force.recalc = T)
+#sc2atlas_mice_combined <- FindClusters(sc2atlas_mice_combined, resolution = 0.07)
+#Idents(sc2atlas_mice_combined) <- "SCT_snn_res.0.07"
+#plot <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "tsne.rpca"), "Cell clusters - Post-integration (RPCA)")
+#print(plot)
+#plot_filename <- paste0("sc2atlas", "/tSNE_clusters_plot_tsne_rpca_space_clusters.png")
+#ggsave(plot_filename, plot, width = 10, height = 8)
+
+Idents(neurons) <- "orig.ident"
+```
+
+
+```{r}
+# Rename the SCT_snn_res.0.07 column in the metadata to rpcatsne_clusters.
+#names(sc2atlas_mice_combined@meta.data)[names(sc2atlas_mice_combined@meta.data) == "SCT_snn_res.0.07"] <- "rpcatsne_clusters"
+# Rename the SCT_snn_res.0.1 column in the metadata to rpcaumap_clusters.
+#names(sc2atlas_mice_combined@meta.data)[names(sc2atlas_mice_combined@meta.data) == "SCT_snn_res.0.1"] <- "rpcaumap_clusters"
+
+names(neurons@meta.data)[names(neurons@meta.data) == "SCT_snn_res.0.1"] <- "rpcaumap_clusters_neurons"
+```
+
+```{r}
+columns_to_remove <- grep("SCT_snn_res", names(sc2atlas_mice_combined@meta.data), value = TRUE)
+columns_to_remove 
+sc2atlas_mice_combined@meta.data[columns_to_remove] <- list(NULL)
+sc2atlas_mice_combined@meta.data
+```
+```{r}
+columns_to_remove <- grep("SCT_snn_res", names(neurons@meta.data), value = TRUE)
+columns_to_remove 
+neurons@meta.data[columns_to_remove] <- list(NULL)
+neurons@meta.data
+```
+
+```{r}
+# Remove the pANN columns from the metadata.
+columns_to_remove <- grep("pANN", names(sc2atlas_mice_combined@meta.data), value = TRUE)
+columns_to_remove
+sc2atlas_mice_combined@meta.data[columns_to_remove] <- list(NULL)
+sc2atlas_mice_combined@meta.data
+```
+
+```{r}
+# Save the filtered, normalized, integrated Seurat object.
+saveRDS(sc2atlas_mice_combined, file = "../Rdata/knafo_mice_combined_rpca.rds")
+```
+
+```{r}
+# Save the filtered, normalized, integrated Seurat object.
+saveRDS(neurons, file = "../Rdata/knafo_mice_neurons_only_rpca.rds")
+```
+
+
+## 8. Find differentially expressed features (marker genes) across all clusters.
+```{r}
+# Clear the environment.
+rm(list = ls())
+# Reload the filtered, normalized, integrated Seurat object.
+sc2atlas_mice_combined <- readRDS("../Rdata/knafo_mice_combined_rpca.rds")
+```
+
+First, we will adjust resolution and k parameters to define the needed GFP cluster/s.
+```{r}
+# Adjust resolution and k parameters to define the needed GFP cluster/s.
+# Apply FindNeighbors and FindClusters on the RPCA UMAP space.
+sc2atlas_mice_combined <- FindNeighbors(sc2atlas_mice_combined, reduction = "umap.rpca", dims = 1:2, k.param = 20, force.recalc = T)
+sc2atlas_mice_combined <- FindClusters(sc2atlas_mice_combined, resolution = 0.01)
+Idents(sc2atlas_mice_combined) <- "SCT_snn_res.0.01"
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+plot <- apply_theme(DimPlot_scCustom(sc2atlas_mice_combined, reduction = "umap.rpca"), "Cell clusters - Post-integration (RPCA) - Resolution and k parameters of 0.01 and 20 respectively")
+print(plot)
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "UMAP_clusters_plot_umap_rpca_space_clusters_gfp_final.png")
+ggsave(plot_filename, plot, width = 10, height = 8)
+
+Idents(sc2atlas_mice_combined) <- "orig.ident"
+```
+
+```{r}
+# Adjust resolution and k parameters to define the needed GFP cluster/s.
+# Apply FindNeighbors and FindClusters on the RPCA UMAP space.
+neurons <- FindNeighbors(neurons, reduction = "umap.rpca", dims = 1:2, k.param = 4, force.recalc = T)
+neurons <- FindClusters(neurons, resolution = 0.05)
+Idents(neurons) <- "SCT_snn_res.0.05"
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+plot <- apply_theme(DimPlot_scCustom(neurons, reduction = "umap.rpca"), "Neurons clusters - Post-integration (RPCA) - Resolution and k parameters of 0.05 and 6 respectively")
+print(plot)
+plot_filename <- paste0("../neurons_mouse/knafo/", "UMAP_clusters_plot_umap_rpca_space_clusters_gfp_final0.png")
+ggsave(plot_filename, plot, width = 10, height = 8)
+
+Idents(neurons) <- "orig.ident"
+```
+
+
+```{r}
+# Rename the SCT_snn_res.0.05 column in the metadata to rpca.umap.adj_clusters.
+#names(sc2atlas_mice_combined@meta.data)[names(sc2atlas_mice_combined@meta.data) == "SCT_snn_res.0.07"] <- "rpca.umap.adj_neurons_clusters"
+#Idents(sc2atlas_mice_combined) <- "rpca.umap.adj_neurons_clusters"
+
+names(neurons@meta.data)[names(neurons@meta.data) == "SCT_snn_res.0.07"] <- "rpca.umap.adj_neurons_clusters"
+Idents(neurons) <- "rpca.umap.adj_neurons_clusters"
+```
+
+```{r}
+columns_to_remove <- grep("SCT_snn_res", names(sc2atlas_mice_combined@meta.data), value = TRUE)
+columns_to_remove 
+sc2atlas_mice_combined@meta.data[columns_to_remove] <- list(NULL)
+sc2atlas_mice_combined@meta.data
+```
+```{r}
+columns_to_remove <- grep("SCT_snn_res", names(neurons@meta.data), value = TRUE)
+columns_to_remove 
+neurons@meta.data[columns_to_remove] <- list(NULL)
+neurons@meta.data
+```
+
+We are interested in clusters 1, 6 and 20 (GFP+ cells).
+
+```{r}
+# Create count table by cluster and by sample
+allcells_count_bycluster <- as.data.frame.matrix(table(sc2atlas_mice_combined@meta.data$orig.ident, sc2atlas_mice_combined@meta.data$rpca.umap.adj_clusters))
+allcells_count_bycluster
+```
+
+```{r}
+# Create count table by cluster and by sample
+allcells_count_bycluster <- as.data.frame.matrix(table(neurons@meta.data$orig.ident, neurons@meta.data$rpca.umap.adj_neurons_clusters))
+allcells_count_bycluster
+```
+
+Now that we have identified the GFP+ cell clusters, we will proceed with the differential expression analysis to identify marker genes. This will allow us to :
+1) verify the identity of certain clusters (e.g. neurons),
+2) help surmise the identity of unknown clusters and
+3) identify potential marker genes for the GFP+ cells (V1).
+
+```{r}
+# Prepare object to run differential expression on SCT assay with multiple models (samples). 
+# This function uses minimum of the median UMI of individual objects to reverse the individual SCT regression model using minimum of median UMI as the sequencing depth covariate. 
+sc2atlas_mice_combined <- PrepSCTFindMarkers(sc2atlas_mice_combined, assay = "SCT", verbose = TRUE)
+```
+
+
+```{r}
+# Find differentially expressed features (marker genes) across all clusters combined.
+# For this analysis we are comparing each cluster against all other clusters to identify cluster markers.
+sc2atlas.markers <- FindAllMarkers(sc2atlas_mice_combined, 
+                                   logfc.threshold = 0.25, # Limit testing to genes which show, on average, at least X-fold difference (log-scale) between two groups of cells. Default is 0.1 Increasing logfc.threshold speeds up the function, but can miss weaker signals. 
+                                   test.use = "wilcox", # Identifies DEGs between two groups of cells using a Wilcoxon Rank Sum test (default).
+                                   min.pct = 0.01, # Only test genes that are detected in a minimum fraction of min.pct cells in either of the populations. Meant to speed up the function by not testing genes that are very infrequently expressed. Default is 0.01.
+                                   only.pos = TRUE) # Only return positive markers (upregulated genes in the cluster of interest).
+view(sc2atlas.markers)
+```
+We increased the logfc.threshold parameter, the minimum log2 foldchange for average expression of gene in cluster relative to the average expression in all other clusters combined from 0.1 (7%) to 0.25 (19%).
+2^0.25 = 1.19 (only genes whose expression increases or decreases by at least 19% will be considered).
+Cons:
+- Could miss those cell markers that are expressed in the cluster being compared, but not in the other clusters, if the average log2FC doesn't meet the threshold.
+- Could return a lot of metabolic/ribosomal genes due to slight differences in metabolic output by different cell types, which are not as useful to distinguish cell type identities.
+
+Output : 
+avg_logFC: average log2 fold change. Positive values indicate that the gene is more highly expressed in the cluster.
+pct.1: The percentage of cells where the gene is detected in the cluster.
+pct.2: The percentage of cells where the gene is detected on average in the other clusters.
+p_val: p-value not adjusted for multiple test correction.
+p_val_adj: Adjusted p-value, based on bonferroni correction using all genes in the dataset, used to determine significance.
+
+We are interested in markers with large differences in expression between pct.1 and pct.2 and larger fold changes.
+
+```{r}
+# Define thresholds
+pct1_threshold <- 0.6  # Minimum percentage of cells in the cluster where the gene must be expressed.
+pct2_threshold <- 0.2 # Maximum percentage of cells in other clusters where the gene can be expressed.
+avg_log2FC_threshold <- 0.25 # Minimum average log2 fold change for a 19% increase (genes whose expression is at least 19% increased in the cluster tested compared to others).
+p_val_adj_threshold <- 0.01 # Maximum adjusted p-value
+
+# Filter the data frame based on these thresholds.
+filtered_markers <- sc2atlas.markers[
+  sc2atlas.markers$pct.1 >= pct1_threshold &
+  sc2atlas.markers$pct.2 <= pct2_threshold &
+  sc2atlas.markers$avg_log2FC >= avg_log2FC_threshold &
+  sc2atlas.markers$p_val_adj <= p_val_adj_threshold,]
+
+# Sort the filtered data frame by cluster and adjusted p-value (considering only significant markers now)
+sorted_filtered_markers <- filtered_markers[order(filtered_markers$cluster, filtered_markers$p_val_adj),]
+
+# Get the top 10 markers for each cluster, if available.
+top_markers <- do.call(rbind, by(data = sorted_filtered_markers, 
+                                 INDICES = sorted_filtered_markers$cluster, 
+                                 FUN = function(x) head(x, 10)))
+
+# Visualize top markers per cluster
+View(top_markers)
+```
+
+```{r}
+# Define the clusters of interest.
+clusters_of_interest <- c(1, 6, 20)
+
+# Define thresholds
+pct1_threshold <- 0.6  # Minimum percentage of cells in the cluster where the gene must be expressed.
+pct2_threshold <- 0.3 # Maximum percentage of cells in other clusters where the gene can be expressed.
+
+# Filter the data frame to include only markers from the clusters of interest.
+filtered_markers <- sc2atlas.markers[
+  sc2atlas.markers$cluster %in% clusters_of_interest &
+  sc2atlas.markers$pct.1 >= pct1_threshold &
+  sc2atlas.markers$pct.2 <= pct2_threshold,]
+
+# Sort the filtered data frame by cluster and adjusted p-value.
+sorted_filtered_markers <- filtered_markers[order(filtered_markers$cluster, filtered_markers$p_val_adj),]
+view(sorted_filtered_markers)
+
+# Get the top 10 markers for each cluster, if available.
+top_markers <- do.call(rbind, by(data = sorted_filtered_markers, 
+                                 INDICES = sorted_filtered_markers$cluster, 
+                                 FUN = function(x) head(x, 10)))
+# Visualize top markers per cluster.
+View(top_markers)
+```
+
+```{r}
+# Extract the gene names for the top markers of this cluster.
+genes_1 <- top_markers$gene[top_markers$cluster == 1]
+genes_6 <- top_markers$gene[top_markers$cluster == 6]
+genes_20 <- top_markers$gene[top_markers$cluster == 20]
+
+# Plot the top markers for cluster 1.
+plot_1 <- FeaturePlot_scCustom(sc2atlas_mice_combined, features = genes_1, reduction = "umap.rpca")
+plot_6 <- FeaturePlot_scCustom(sc2atlas_mice_combined, features = genes_6, reduction = "umap.rpca")
+plot_20 <- FeaturePlot_scCustom(sc2atlas_mice_combined, features = genes_20, reduction = "umap.rpca")
+# Save the plots.
+plot_1
+filename <- paste0("sc2atlas", "/top_markers_cluster_1_umap_rpca.png")
+ggsave(filename, plot_1, width = 10, height = 8)
+plot_6
+filename <- paste0("sc2atlas", "/top_markers_cluster_6_umap_rpca.png")
+ggsave(filename, plot_6, width = 10, height = 8)
+plot_20
+filename <- paste0("sc2atlas", "/top_markers_cluster_20_umap_rpca.png")
+ggsave(filename, plot_20, width = 10, height = 8)
+```
+
+```{r}
+# Add a new column 'V1_clusters' to the metadata to distinguish between V1 and other clusters.
+sc2atlas_mice_combined@meta.data$V1_clusters <- ifelse(
+  sc2atlas_mice_combined@meta.data$rpca.umap.adj_clusters %in% c(1, 6, 20), 
+  "V1", 
+  "other"
+)
+```
+
+```{r}
+# Set the V1_clusters column as the identity.
+Idents(sc2atlas_mice_combined) <- "V1_clusters"
+# Find genes that are differently expressed between V1 and other clusters.
+V1_markers = FindMarkers(sc2atlas_mice_combined, assay = "SCT", ident.1 = "V1", ident.2 = "other", logfc.threshold = 0.25, test.use = "wilcox", min.pct = 0.25, only.pos = FALSE)
+```
+
+```{r}
+# Define thresholds
+pct1_threshold <- 0.6  # Minimum percentage of cells in the cluster where the gene must be expressed.
+pct2_threshold <- 0.3 # Maximum percentage of cells in other clusters where the gene can be expressed.
+
+# Filter the data frame to include only markers from the clusters of interest.
+filtered_markers <- V1_markers[
+  V1_markers$pct.1 >= pct1_threshold &
+  V1_markers$pct.2 <= pct2_threshold,]
+
+# Sort the filtered data frame by adjusted p-value.
+sorted_filtered_markers <- filtered_markers[order(filtered_markers$p_val_adj),]
+#view(sorted_filtered_markers)
+
+# Get the top markers for V1.
+top_markers <- head(sorted_filtered_markers, 10)
+# Convert row names to a column.
+top_markers <- tibble::rownames_to_column(top_markers, var = "gene")
+top_markers
+genes_wilcox <- top_markers$gene
+```
+
+```{r}
+# Extract the gene names for the top markers.
+genes_to_plot <- top_markers$gene
+
+# Plot the top markers for cluster 1.
+plot <- FeaturePlot_scCustom(sc2atlas_mice_combined, features = genes_to_plot, reduction = "umap.rpca", order = F)
+# Save the plots.
+plot
+filename <- paste0("sc2atlas", "/top_markers_V1_umap_rpca_sc.png")
+ggsave(filename, plot, width = 10, height = 8)
+```
+
+```{r}
+# FeaturePlot_scCustom(sc2atlas_mice_combined, features = "Cdh18", split.by = "orig.ident", num_columns = 4, reduction = "umap.rpca")
+```
+
+```{r}
+# Change the method.
+# Find genes that are differently expressed between V1 and other clusters.
+V1_markers <- FindMarkers(sc2atlas_mice_combined, ident.1 = "V1", ident.2 = "other", test.use = "roc", thresh.use = 0.25, min.pct = 0.1, only.pos = FALSE)
+```
+
+```{r}
+# Define thresholds
+pct1_threshold <- 0.6  # Minimum percentage of cells in the cluster where the gene must be expressed.
+pct2_threshold <- 0.3 # Maximum percentage of cells in other clusters where the gene can be expressed.
+
+# Filter the data frame to include only markers from the clusters of interest.
+filtered_markers <- V1_markers[
+  V1_markers$pct.1 >= pct1_threshold &
+  V1_markers$pct.2 <= pct2_threshold,]
+
+# Sort the filtered data frame by AUC.
+sorted_filtered_markers <- filtered_markers[order(filtered_markers$myAUC),]
+#view(sorted_filtered_markers)
+
+# Get the top markers for V1.
+top_markers <- head(sorted_filtered_markers, 10)
+# Convert row names to a column.
+top_markers <- tibble::rownames_to_column(top_markers, var = "gene")
+top_markers
+genes_auc <- top_markers$gene
+```
+
+```{r}
+# Extract the gene names for the top markers.
+genes_to_plot <- top_markers$gene
+
+# Plot the top markers for cluster 1.
+plot <- FeaturePlot_scCustom(sc2atlas_mice_combined, features = genes_to_plot, reduction = "umap.rpca", order = F)
+# Save the plots.
+plot
+filename <- paste0("sc2atlas", "/top_markers_V1_umap_rpca_auc_adj_sc_.png")
+ggsave(filename, plot, width = 10, height = 8)
+```
+
+## 9. Cell types analysis.
+```{r}
+# Set cluster identity.
+Idents(sc2atlas_mice_combined) <- "rpca.umap.adj_clusters"
+
+# Marker genes for main spinal cell types from the literature.
+neurons.markers=c("Snap25", "Rbfox3", "Syp","Snhg11")
+oligo.markers=c("Mobp", "Mog", "Plp1", "Mag", "Mbp")
+schwann.markers=c("Mpz", "Pmp22")
+meningo.markers=c("Dcn", "Col1a2", "Itga10", "Igf2", "Col3a1", "Col25a1", "Bicc1", "Pdzm3", "Slc47a1")
+astro.markers=c("Gfap", "Aldh1l1", "Fgfr3", "Col23a", "Aqp4", "Slc1a2", "Trp63", "Slc7a10", "Atp1a2", "Gja1")
+OPC.markers=c("Vcan", "Pdgfra", "Cspg4", "Gpr17")
+microglia.markers=c("Ctss", "Csf1r", "Ptprc", "Itgam", "Ly86", "Myo1f")
+ependyma.markers=c("Dnah11", "Spag6", "Cfap157", "Dnah12", "Cfap43")
+endothelial.markers=c("Flt1", "Pecam1", "Pdgfrb", "Notch3", "Abcc9", "Lyc6c1", "Tek", "Myl9")
+
+allcells.markers=list(neurons.markers,oligo.markers,schwann.markers,meningo.markers,astro.markers,OPC.markers,microglia.markers,ependyma.markers,endothelial.markers)
+names(allcells.markers)=c("neurons","oligodendro","schwan","meningo","astrocytes","OPC","microglia","ependyma","endothelial")
+
+# Visualize marker genes for all clusters.
+plot <- DotPlot(sc2atlas_mice_combined, features = allcells.markers) + RotatedAxis()
+plot
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "dotplot_allcells_types.jpg")
+ggsave(plot_filename, plot, width = 14, height = 8)
+```
+
+```{r}
+# Annotate clusters by cell types.
+celltype <- (sc2atlas_mice_combined@meta.data[["rpca.umap.adj_clusters"]])
+celltype <- recode_factor(celltype, 
+                          "0" = "neurons", "2" = "neurons", "5" = "neurons", "6" = "neurons", "7" = "neurons", "8" = "neurons", "9" = "neurons", "10" = "neurons", "11" = "neurons", "14" = "neurons", "17" = "neurons", "18" = "neurons", "19" = "neurons",
+                          
+                          "1" = "oligodendrocytes", 
+                          
+                          "12" = "endothelial",
+                          
+                          "4" = "astrocytes",
+                          
+                          "16" = "OPC",
+                          
+                          )
+                  
+names(celltype) <- colnames(x = sc2atlas_mice_combined)
+sc2atlas_mice_combined <- AddMetaData(
+  object = sc2atlas_mice_combined,
+  metadata = celltype,
+  col.name = "celltype"
+)
+```
+
+```{r}
+# Create count table by cell type and by sample.
+allcells_count_bycelltype <- as.data.frame.matrix(table(sc2atlas_mice_combined@meta.data$orig.ident, sc2atlas_mice_combined@meta.data$celltype))
+allcells_count_bycelltype
+
+# Save the table as a CSV file
+write.csv(allcells_count_bycelltype, "../sc2atlas_mouse/knafo/allcells_count_bycelltype.csv", row.names = TRUE)
+# Alternatively, save as a tab-delimited text file
+write.table(allcells_count_bycelltype, "../sc2atlas_mouse/knafo/allcells_count_bycelltype.txt", sep = "\t", row.names = TRUE)
+```
+
+```{r}
+# Convert row names to a column named 'Sample'.
+allcells_count_bycelltype <- allcells_count_bycelltype %>%
+  tibble::rownames_to_column(var = "Sample")
+
+# Transform data to long format.
+df_long <- pivot_longer(
+  allcells_count_bycelltype,
+  cols = -Sample,
+  names_to = "CellType",
+  values_to = "Count"
+)
+
+# Calculate percentages.
+df_long <- df_long %>%
+  group_by(Sample) %>%
+  mutate(Percentage = Count / sum(Count) * 100)
+
+#viridis_colors <- c(
+  #"#440154", "#482475", "#414487", "#355F8D", "#2A788E",
+  #"#21908C", "#22A884", "#42BE71", "#7AD151", "#fde725")
+viridis_colors <- c(
+  "#440154", "#414487", "#2A788E",
+  "#21908C", "#22A884", "#42BE71", "#7AD151", "#fde725")
+#viridis_colors <- c(
+  #"#440154", "#414487", "#355F8D", "#21908C", "#7AD151", "#fde725")
+
+# Create the stacked barplot with labels for specific cell types.
+plot <- ggplot(df_long, aes(x = Sample, y = Percentage, fill = CellType)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = viridis_colors) +
+  geom_text(
+    aes(label = ifelse(CellType %in% c("V1", "neurons"), sprintf("%.1f%%", Percentage), "")),
+    position = position_stack(vjust = 0.5),  # Center the text in the middle of each segment
+    size = 4,  # Adjust text size as needed
+    color = "white",  # Choose a color that stands out
+    fontface = "bold"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) +
+  labs(y = "Percentage of Cells", x = "Sample", title = "Distribution of Cell Types per Sample", fill = "Cell Type")
+plot 
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "stacked_barplot_celltypes.png")
+ggsave(plot_filename, plot, width = 10, height = 8)
+```
+
+```{r}
+# Visualize cell types in UMAP.
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(face = "bold"),
+          axis.text.y = element_text(face = "bold"))
+}
+plot <- apply_theme(DimPlot(sc2atlas_mice_combined, reduction = "umap.rpca", group.by = "celltype", label = TRUE), "Cell types")
+plot
+plot_filename <- paste0("../sc2atlas_mouse/knafo/", "UMAP_celltypes_plot_combined_mice_rpca.png")
+ggsave(plot_filename, plot, width = 10, height = 8)
+```
+
+```{r}
+# Set the identity to the cell type.
+Idents(sc2atlas_mice_combined) <- "celltype"
+# Create a subset of the Seurat object with only neurons
+neurons_only <- subset(sc2atlas_mice_combined, idents = "neurons")
+# Save the neurons_only Seurat object
+saveRDS(neurons_only, file = "../Rdata/knafo_mice_neurons_only.rds")
+```
+
+```{r}
+# Set the identity to the cell type.
+Idents(sc2atlas_mice_combined) <- "celltype"
+
+# Marker genes for V1.
+# MACS.markers=c("Sun1-2xsfGFP-6xmyc","pAM16-R26-Sun1","Snap25", "Rbfox3", "Syp","Snhg11","Neun")
+Bikoff.markers=c("Snap25", "Rbfox3","Bhlhb5","Foxp1","Foxp2","Foxp4","Lmo3","Mafa","Mafb","Nr3b2","Nr3b3","Nr4a2","Nr5a2","Onecut1","Onecut2","Otp","Pou6f2","Prdm8","Prox1","Sp8","Zfhx4")
+Russ.markers=c("Snap25", "Rbfox3","Slc6a5","Gad2","Foxp2","Pou6f2","Gata3","Esrrb","Nr5a2","Gm26673","Pvalb","Chrna2","Chrna7","Calb1")
+
+FeaturePlot(sc2atlas_mice_combined, c("pAM16-R26-Sun1","Snhg11"), reduction = "umap.rpca")
+p1 <- apply_theme(DotPlot_scCustom(sc2atlas_mice_combined, features = Bikoff.markers), "V1 Bikoff markers") + RotatedAxis()
+p1
+p1_filename <- paste0("sc2atlas", "/dotplot_Bikoff_markers_rpca.png")
+ggsave(p1_filename, p1, width = 10, height = 8)
+p2 <- apply_theme(DotPlot_scCustom(sc2atlas_mice_combined, features = Russ.markers), "Expression profils - V1 Russ markers") + RotatedAxis()
+p2
+p2_filename <- paste0("sc2atlas", "/dotplot_Russ_markers_rpca.png")
+ggsave(p2_filename, p2, width = 10, height = 8)
+p3 <- apply_theme(DotPlot_scCustom(sc2atlas_mice_combined, features = genes_auc), "Expression profils - V1 markers - AUC") + RotatedAxis()
+p3
+p3_filename <- paste0("sc2atlas", "/dotplot_V1_markers_rpca_auc.png")
+ggsave(p3_filename, p3, width = 10, height = 8)
+p4 <- apply_theme(DotPlot_scCustom(sc2atlas_mice_combined, features = genes_wilcox), "Expression profils - V1 markers - Wilcoxon Rank Sum test") + RotatedAxis()
+p4
+p4_filename <- paste0("sc2atlas", "/dotplot_V1_markers_rpca_wilcox.png")
+ggsave(p4_filename, p4, width = 10, height = 8)
+```
+
+```{r}
+FeaturePlot_scCustom(sc2atlas_mice_combined, c("Slc32a1"), reduction = "umap.rpca")
+```
+
+```{r}
+# Find markers and limit to those expressed in greater than 75% of target population.
+all_markers <- FindAllMarkers(sc2atlas_mice_combined) %>%
+    Add_Pct_Diff() %>%
+    dplyr::filter(pct_diff > 0.6)
+```
+
+```{r}
+# Extract top markers for each cluster.
+top_markers <- Extract_Top_Markers(marker_dataframe = all_markers, num_genes = 10, named_vector = FALSE,
+    make_unique = TRUE)
+Clustered_DotPlot(sc2atlas_mice_combined, features = top_markers)
+```

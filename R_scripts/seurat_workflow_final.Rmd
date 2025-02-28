@@ -1,0 +1,2298 @@
+---
+title: "10x snRNA-seq & CITE-seq data analysis - Seurat workflow"
+author: "Souad Youjil Abadi" 
+date: "2024-03-15"
+output: html_document
+---
+
+# Seurat Workflow: 
+## 1. Pre-processing: 
+- Ambient RNA removal
+- Filtering of cells & genes : doublet detection & QC metrics 
+## 2. Processing:
+- Data normalization (SCTransform chosen (cf. M2 presentation))
+- Dimensionality reduction 
+- Optimal number of PCs
+- Check unwanted biological variation (effects of cell cycle, mitochondrial expression, ...) (not included in this script cf. M2 presentation) 
+## 3. Integration & Clustering:
+- Integration 
+- Optimal resolution 
+- Graph clustering 
+## 4. Clusters annotation (negative selection)
+- Based on cell type markers (negative selection)
+## 5. Mouse V1 classification using CITE-seq samples as reference (positive selection)
+- Based on CITE-seq data (positive selection)
+
+```{r setup, include=FALSE}
+# Set global options for all chunks
+knitr::opts_chunk$set(
+  echo = TRUE       # TRUE  = Display the code in the html output document
+#  warning = FALSE, # FALSE = Don't display warnings in the html output document
+#  message = FALSE  # FALSE = Don't display messages in the html output document
+) 
+```
+ 
+# 0. Install and load required libraries
+```{r} 
+# Ensure 'pak' package is installed
+if (!requireNamespace("pak", quietly = TRUE)) {
+  install.packages("pak") 
+}
+library(pak)                           
+
+# Install necessary packages
+pak::pkg_install(c(
+  "Seurat",                            # Core package for scRNA-seq analysis
+  "scCustomize",                       # Enhances customization of Seurat workflows
+  "SoupX",                             # Removes ambient RNA contamination
+  "chris-mcginnis-ucsf/DoubletFinder", # Identifies potential doublets in scRNA-seq data
+  "biomaRt",                           # Access BioMart and Ensembl databases
+  "dplyr",                             # Data manipulation
+  "knitr",                             # Report generation
+  "roxygen2"                           # Documentation
+))
+
+```
+
+```{r}
+# Load necessary libraries
+library(Seurat)               
+library(scCustomize)          
+library(SoupX)                
+library(DoubletFinder)
+library(biomaRt)
+library(dplyr)
+library(knitr)
+library(roxygen2)
+library(ggplot2)
+
+# Set seed for reproducibility
+set.seed(1234)
+
+# Increase memory usage
+options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB for global variables in future expressions
+```
+
+```{r}
+# List of CRAN packages
+cran_packages <- c(
+  "Seurat",       # Core package for scRNA-seq analysis
+  "scCustomize",  # Enhances customization of Seurat workflows
+  "SoupX",        # Removes ambient RNA contamination
+  "biomaRt",      # Access BioMart and Ensembl databases
+  "dplyr",        # Data manipulation
+  "knitr",        # Report generation
+  "roxygen2"      # Documentation
+)
+
+# Install missing CRAN packages
+installed_cran <- cran_packages %in% installed.packages()
+if (any(!installed_cran)) {
+  install.packages(cran_packages[!installed_cran])
+}
+
+# Load CRAN packages
+lapply(cran_packages, library, character.only = TRUE)
+
+# Install and load DoubletFinder from GitHub
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+if (!"DoubletFinder" %in% installed.packages()) {
+  remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")
+}
+library(DoubletFinder)
+
+# Set seed for reproducibility
+set.seed(1234)
+
+# Increase memory usage
+options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB for global variables in future expressions
+```
+
+# 1. Pre-processing
+```{r}
+#-------------------------------------------------------------------------------
+# Define the general paths to save the pre-processed samples
+#-------------------------------------------------------------------------------
+mouse_save_path <- file.path(getwd(), "Rdata", "mouse", "all_cells", "all_samples")
+human_save_path <- file.path(getwd(), "Rdata", "human", "all_cells", "all_samples")
+#-------------------------------------------------------------------------------
+# Define the general paths to save the figures
+#-------------------------------------------------------------------------------
+mouse_path_figures <- file.path(getwd(),"figures", "mouse", "all_cells", "all_samples")
+human_path_figures <- file.path(getwd(), "figures", "human", "all_cells", "all_samples")
+```
+
+## 1.1 Load 10X snRNA-seq data and calculate the corrected count matrices with SoupX – Using CellRanger clusters
+```{r}
+#' This function creates a `SoupChannel` for each sample, removes ambient RNA contamination
+#' using SoupX and returns a list of `Seurat` objects with corrected counts.
+#'
+#' @param species (str)           : Species directory. Default is `"mouse"`.
+#' @param author  (str, optional) : Author directory. If `NULL` (default), all authors in the species directory are processed.
+#' @return (list)                 : A list of `Seurat` objects representing the corrected counts for each sample.
+#' @examples
+#' \dontrun{
+#' # Process all mouse data
+#' mouse <- correct_counts_soupx(species = "mouse")
+#'
+#' # Process all human data
+#' human <- correct_counts_soupx(species = "human")
+#'
+#' # Process data for a specific author (e.g., "Knafo") in the mouse directory
+#' knafo <- correct_counts_soupx(species = "mouse", author = "Knafo")
+#' }
+#' @export
+correct_counts_soupx <- function(species = "mouse", author = NULL) {
+  # --------------------------------------------------------------------------
+  # Define the base path
+  # Assumes that your data is organized in directories named after the species
+  # and that each species folder may contain one or more subdirectories (authors)
+  # --------------------------------------------------------------------------
+  base_path <- file.path(getwd(), "..", "count_matrices", species)
+  
+  # --------------------------------------------------------------------------
+  # If 'author' is provided, we only process that specific author folder
+  # Otherwise, we process all author directories found under the base path
+  # --------------------------------------------------------------------------
+  if (!is.null(author)) {
+    author_dirs <- file.path(base_path, author)
+    if (!dir.exists(author_dirs)) {
+      stop("Specified author directory does not exist: ", author_dirs)
+    }
+  } else {
+    author_dirs <- list.dirs(base_path, recursive = FALSE, full.names = TRUE)
+  }
+  
+  # Create an empty list to store Seurat objects from each sample
+  seurat_list <- list()
+  
+  # Iterate over each author directory to find and process sample directories
+  for (author_dir in author_dirs) {
+    
+    # Find all sample directories within the current author directory
+    # Each sample directory should contain an "outs" subfolder from CellRanger
+    sample_dirs <- list.files(author_dir, full.names = TRUE)
+    
+    for (sample_dir in sample_dirs) {
+      
+      # Skip folders that don't have an "outs" directory (i.e., citeseq & macs folders in Knafo's dir)
+      if (!dir.exists(file.path(sample_dir, "outs"))) {
+        message("Skipping non-sample folder: ", sample_dir)
+        next
+      }
+      
+      # Extract the sample name from the directory path
+      sample_name <- basename(sample_dir)
+      message("Processing sample: ", sample_name)
+      
+      # ----------------------------------------------------------------------
+      # 1. Create a SoupChannel object with 10X data (CellRanger clusters)
+      # 2. Estimate the ambient RNA contamination (rho)
+      # 3. Adjust the counts using autoEstCont (SoupX)
+      # 4. Round the corrected counts to integers
+      # ----------------------------------------------------------------------
+      outs_folder <- file.path(sample_dir, "outs")
+      soup_channel <- load10X(outs_folder)
+      soup_channel <- autoEstCont(soup_channel)
+      corrected_counts <- adjustCounts(soup_channel, roundToInt = TRUE)
+      
+      # Create a Seurat object using the corrected (SoupX-adjusted) counts
+      seurat_obj <- CreateSeuratObject(counts = corrected_counts, project = sample_name)
+      
+      # Save the Seurat object in the output list, keyed by sample name
+      seurat_list[[sample_name]] <- seurat_obj
+    }
+  }
+  
+  # Return the list of Seurat objects for all processed samples
+  return(seurat_list)
+}
+# ------------------------------------------------------------------------------
+# Example usage
+# ------------------------------------------------------------------------------
+# mouse <- correct_counts_soupx(species = "mouse")
+# human <- correct_counts_soupx(species = "human")
+# knafo <- correct_counts_soupx(species = "mouse", author = "Knafo")
+```
+
+## 1.1.bis Load 10X scRNA-seq data and calculate the corrected count matrices with SoupX – Using Seurat clusters
+```{r}
+#' This function creates a `SoupChannel` for each sample, removes ambient RNA contamination
+#' using SoupX and returns a list of `Seurat` objects with corrected counts.
+#'
+#' @param species (str)           : Species directory. Default is `"mouse"`.
+#' @param author  (str, optional) : Author directory. If `NULL` (default), all authors in the species directory are processed.
+#' @return (list)                 : A list of `Seurat` objects representing the corrected counts for each sample.
+#' @examples
+#' \dontrun{
+#' # Process all mouse data
+#' mouse_list <- correct_counts_soupx_seurat(species = "mouse")
+#'
+#' # Process all human data
+#' human_list <- correct_counts_soupx_seurat(species = "human")
+#'
+#' # Process data for a specific author (e.g., "Knafo") in the mouse directory
+#' knafo_list <- correct_counts_soupx_seurat(species = "mouse", author = "Knafo")
+#' }
+#' @export
+correct_counts_soupx_seurat <- function(species = "mouse", author = NULL) {
+  # --------------------------------------------------------------------------
+  # Define the base path
+  # Assumes that your data is organized in directories named after the species
+  # and that each species folder may contain one or more subdirectories (authors)
+  # --------------------------------------------------------------------------
+  base_path <- file.path(getwd(), "..", "count_matrices", species)
+
+  # --------------------------------------------------------------------------
+  # If 'author' is provided, we only process that specific author folder
+  # Otherwise, we process all author directories found under the base path
+  # --------------------------------------------------------------------------
+  if (!is.null(author)) {
+    author_dirs <- file.path(base_path, author)
+    if (!dir.exists(author_dirs)) {
+      stop("Specified author directory does not exist: ", author_dirs)
+    }
+  } else {
+    author_dirs <- list.dirs(base_path, recursive = FALSE, full.names = TRUE)
+  }
+
+  # Create an empty list to store Seurat objects from each sample
+  seurat_list <- list()
+
+  # Iterate over each author directory to find and process sample directories
+  for (author_dir in author_dirs) {
+
+    # Find all sample directories within the current author directory
+    sample_dirs <- list.files(author_dir, full.names = TRUE)
+
+    for (sample_dir in sample_dirs) {
+      
+      # Skip folders that don't have an "outs" directory (i.e., citeseq & macs folders in Knafo's dir)
+      if (!dir.exists(file.path(sample_dir, "outs"))) {
+        message("Skipping non-sample folder: ", sample_dir)
+        next
+      }
+      # Extract the sample name from the directory path
+      sample_name <- basename(sample_dir)
+      message("Processing sample: ", sample_name)
+
+      # ----------------------------------------------------------------------
+      # 1. Load the raw and filtered matrices using Seurat's Read10X function
+      # 2. Create Seurat objects for raw and filtered matrices
+      # 3. Perform basic clustering on the filtered object (needed for SoupX) 
+      # ----------------------------------------------------------------------
+      # Define paths to raw and filtered matrices
+      raw_matrix_dir <- file.path(sample_dir, "outs", "raw_feature_bc_matrix")
+      filtered_matrix_dir <- file.path(sample_dir, "outs", "filtered_feature_bc_matrix")
+      
+      seurat_raw <- CreateSeuratObject(counts = Read10X(raw_matrix_dir),project = paste0(sample_name, "_raw"))
+      seurat_filtered <- CreateSeuratObject(counts = Read10X(filtered_matrix_dir), project = paste0(sample_name, "_filtered"))
+      
+      seurat_filtered <- SCTransform(seurat_filtered, vst.flavor = "v1")  # Transformed data will be available in the SCT assay which is set as the default after running SCTransform
+      # Check the default assay
+      DefaultAssay(seurat_filtered)
+      seurat_filtered <- RunPCA(seurat_filtered)  # Uses scaled data (scale.data) is in the active assay (SCT here)
+      seurat_filtered <- RunUMAP(seurat_filtered, reduction = "pca", dims = 1:30)
+      #Instead of applying FindNeighbors (which builds the SNN graph) 
+      # and FindClusters (which runs community detection on that graph) on the PCA space,
+      # we will apply them on the UMAP space (To avoid clusters mixed with cells from other clusters)
+      seurat_filtered <- FindNeighbors(seurat_filtered, reduction = "umap", dims = 1:2, force.recalc = T)
+      #seurat_filtered <- FindNeighbors(seurat_filtered, reduction = "pca", dims = 1:30)
+      seurat_filtered <- FindClusters(seurat_filtered, resolution = 0.05)
+      plt <- DimPlot_scCustom(seurat_filtered, reduction = "umap", group.by = "seurat_clusters", label = TRUE)
+      print(plt)
+      
+      # ----------------------------------------------------------------------
+      # 4. Use raw and filtered counts to create a SoupChannel
+      # 5. Assign clusters to cells in the SoupChannel 
+      # 6. Estimate ambient RNA contamination and adjust counts
+      # ----------------------------------------------------------------------
+      counts_raw      <- GetAssayData(seurat_raw, assay = "RNA", layer = "counts")
+      counts_filtered <- GetAssayData(seurat_filtered, assay = "RNA", layer = "counts")
+      soup_channel <- SoupChannel(tod = counts_raw, toc = counts_filtered)
+
+      # Add seurat clusters and UMAP embeddings to the SoupChannel
+      meta <- seurat_filtered@meta.data
+      soup_channel <- setClusters(soup_channel, setNames(meta$seurat_clusters, rownames(meta)))
+      # umap <- seurat_filtered@reductions$umap@cell.embeddings
+      # soup_channel <- setDR(soup_channel, umap)
+
+      # Estimate contamination and adjust counts
+      soup_channel <- autoEstCont(soup_channel)
+      counts_adjusted <- adjustCounts(soup_channel, roundToInt = TRUE)
+
+      # Create a Seurat object with the corrected counts
+      seurat_obj <- CreateSeuratObject(counts = counts_adjusted, project = sample_name)
+
+      # Save the Seurat object in the output list
+      seurat_list[[sample_name]] <- seurat_obj
+    }
+  }
+
+  # Return the list of Seurat objects for all processed samples
+  return(seurat_list)
+}
+# ------------------------------------------------------------------------------
+# Example usage
+# ------------------------------------------------------------------------------
+# mouse_list <- correct_counts_soupx_seurat(species = "mouse")
+human_list <- correct_counts_soupx_seurat(species = "human")
+# knafo_list <- correct_counts_soupx_seurat(species = "mouse", author = "Knafo")
+```
+
+## 1.2 Load 10X snRNA-seq + Antibody Tag data (CITE-seq) – Using Seurat clusters
+```{r}
+#' Correct ambient RNA contamination in 10X CITE-seq data using SoupX 
+#' and Seurat-derived clusters, then attach Antibody capture assay.
+#'
+#' This function:
+#' 1) Reads both raw and filtered 10X matrices for each sample. 
+#' 2) Creates a Seurat object from the filtered RNA, performs basic clustering on the filtered object (needed for SoupX).
+#' 3) Creates a SoupChannel using the raw and filtered RNA counts.
+#' 4) Assigns Seurat clusters to cells in SoupChannel.
+#' 5) Corrects RNA counts, then creates a final Seurat object with corrected RNA.
+#' 6) Adds the Antibody assay from the filtered data.
+#'
+#' @param citeseq_path (str) : Path to the directory containing CITE-seq samples.
+#' @return (list)            : A list of Seurat objects.
+#' @examples
+#' \dontrun{
+#' # Example path to your CITE-seq folder
+#' citeseq_path <- file.path(getwd(), "..", "count_matrices", "mouse", "Knafo", "citeseq")
+#' citeseq_list <- correct_citeseq_counts_soupx(citeseq_path = citeseq_path)
+#' }
+#' @export
+correct_citeseq_counts_soupx <- function(citeseq_path) {
+  # --------------------------------------------------------------------------
+  # Identify sample directories
+  sample_dirs <- list.dirs(citeseq_path, recursive = FALSE, full.names = TRUE)
+  
+  # Initialize a list to store Seurat objects
+  seurat_list <- list()
+  
+  # Loop through each sample directory
+  for (sample_dir in sample_dirs) {
+    
+    # Skip folders that don't have an "outs" directory (i.e., citeseq & macs folders in Knafo's dir)
+    if (!dir.exists(file.path(sample_dir, "outs"))) {
+      message("Skipping non-sample folder: ", sample_dir)
+      next
+    }
+    sample_name <- basename(sample_dir)
+    message("Processing CITE-seq sample: ", sample_name)
+    
+    # ------------------------------------------------------------------------
+    # 1. Define paths for raw and filtered 10X matrices 
+    # 2. Create Seurat objects with RNA data only
+    # ------------------------------------------------------------------------
+    outs_folder         <- file.path(sample_dir, "outs")
+    raw_matrix_dir      <- file.path(outs_folder, "raw_feature_bc_matrix")
+    filtered_matrix_dir <- file.path(outs_folder, "filtered_feature_bc_matrix")
+    
+    # Read 10X data
+    raw_data      <- Read10X(raw_matrix_dir)
+    filtered_data <- Read10X(filtered_matrix_dir)
+    
+    # Extract RNA count matrices
+    raw_rna      <- raw_data$`Gene Expression`       # RNA count matrix
+    filtered_rna <- filtered_data$`Gene Expression`  # RNA count matrix
+    
+    # Create Seurat objects
+    seurat_raw      <- CreateSeuratObject(counts = raw_rna, project = paste0(sample_name, "_raw"))
+    seurat_filtered <- CreateSeuratObject(counts = filtered_rna, project = paste0(sample_name, "_filtered"))
+    
+    # ------------------------------------------------------------------------
+    # 3. Perform clustering on the filtered data
+    # ------------------------------------------------------------------------
+    seurat_filtered <- SCTransform(seurat_filtered, vst.flavor = "v1")  # Transformed data will be available in the SCT assay which is set as the default after running SCTransform
+    seurat_filtered <- RunPCA(seurat_filtered)  # Uses scaled data (scale.data) is in the active assay (SCT here)
+    seurat_filtered <- RunUMAP(seurat_filtered, reduction = "pca", dims = 1:30)
+    #Instead of applying FindNeighbors (which builds the SNN graph) 
+    # and FindClusters (which runs community detection on that graph) on the PCA space,
+    # we will apply them on the UMAP space (To avoid clusters mixed with cells from other clusters)
+    seurat_filtered <- FindNeighbors(seurat_filtered, reduction = "umap", dims = 1:2, force.recalc = T)
+    #seurat_filtered <- FindNeighbors(seurat_filtered, reduction = "pca", dims = 1:30)
+    seurat_filtered <- FindClusters(seurat_filtered, resolution = 0.05)
+    plt <- DimPlot_scCustom(seurat_filtered, reduction = "umap", group.by = "seurat_clusters", label = TRUE)
+    print(plt)
+    
+    # ------------------------------------------------------------------------
+    # 4. Create SoupChannel from raw/filtered RNA counts and add Seurat clusters
+    # 5. Estimate contamination and adjust counts
+    # ------------------------------------------------------------------------
+    soup_channel <- SoupChannel(
+      tod = GetAssayData(seurat_raw,      assay = "RNA", layer = "counts"),
+      toc = GetAssayData(seurat_filtered, assay = "RNA", layer = "counts")
+    )
+    meta <- seurat_filtered@meta.data
+    soup_channel <- setClusters(soup_channel, setNames(meta$seurat_clusters, rownames(meta)))
+    soup_channel    <- autoEstCont(soup_channel)
+    counts_adjusted <- adjustCounts(soup_channel, roundToInt = TRUE)
+    
+    # Create a new Seurat object with corrected RNA
+    seurat_adj <- CreateSeuratObject(counts = counts_adjusted, project = sample_name)
+    
+    # ------------------------------------------------------------------------
+    # 6. Attach Antibody Capture from the filtered data
+    # ------------------------------------------------------------------------
+    filtered_antibody <- filtered_data$`Antibody Capture`  # Antibody matrix
+    
+    # Check if the two matrices RNA and ADT have the same barcodes:
+    all.equal(colnames(filtered_rna), colnames(filtered_antibody))
+    
+    # Create and assign the antibody assay
+    ab_assay <- CreateAssayObject(counts = filtered_antibody)
+    seurat_adj[["Antibody"]] <- ab_assay
+    
+    # Store in the output list
+    seurat_list[[sample_name]] <- seurat_adj
+  }
+  
+  return(seurat_list)
+}
+# ------------------------------------------------------------------------------
+# Example usage
+# ------------------------------------------------------------------------------
+citeseq_path <- file.path(getwd(), "..", "count_matrices", "mouse", "Knafo", "citeseq")
+citeseq_list <- correct_citeseq_counts_soupx(citeseq_path = citeseq_path)
+
+# Append citeseq_list to mouse_list
+mouse_list <- c(mouse_list, citeseq_list)
+# Order the combined list alphabetically by names
+mouse_list <- mouse_list[order(names(mouse_list))]
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# Save the corrected objects
+# ------------------------------------------------------------------------------
+# saveRDS(mouse_list, file = file.path(mouse_save_path, "mouse_soupx.rds"))
+saveRDS(human_list, file = file.path(human_save_path, "human_soupx.rds"))
+```
+
+## 1.3 Filtering of potential doublets with DoubletFinder
+```{r}
+# Load the RDS files
+# mouse_list <- readRDS(file.path(mouse_save_path, "mouse_soupx.rds"))
+human_list <- readRDS(file.path(human_save_path, "human_soupx.rds"))
+```
+
+```{r}
+# Count the number of cells in each Seurat object within seurat_list
+cell_counts <- sapply(human_list,  # mouse_list or human_list 
+                      function(seurat_obj) {
+                        ncol(seurat_obj)
+                        }
+                      )
+print(cell_counts)
+```
+
+```{r}
+# Check multiplet rate (%) based on the number of cells recovered
+# Reference : https://kb.10xgenomics.com/hc/en-us/articles/360001378811-What-is-the-maximum-number-of-cells-that-can-be-profiled
+
+# Base multiplet rate for 1000 cells
+base_rate <- 0.008  # 0.8%
+# Calculate multiplet rates
+multiplet_rates <- base_rate * (cell_counts / 1000)
+# Print the results
+print(multiplet_rates)
+```
+
+```{r}
+#' Detect doublets in a list of Seurat objects using DoubletFinder.
+#'
+#' This function processes each Seurat object in `seurat_list` by:
+#'   1. Performing Seurat standard workflow on the adjusted counts.
+#'   2. Identifying the optimal pK (no ground-truth).
+#'   3. Estimating homotypic doublet proportions.
+#'   4. Assigning doublet classifications (singlet vs. doublet) in the metadata.
+#'
+#' @param seurat_list (list)   : A list of Seurat objects. Each object is treated independently.
+#' @param base_rate (numeric)  : Base multiplet rate. Default is `0.008` (i.e., 0.8% for 1,000 cells). 
+#'                               This rate is multiplied by (number of cells / 1,000) to get the 
+#'                               sample-specific doublet fraction.
+#'
+#' @return (list)              : The updated list of Seurat objects, each containing 
+#'                               doublet classifications in a newly created metadata column.
+#'
+#' @export
+detect_doublets <- function(seurat_list, base_rate = 0.008) {
+  # --------------------------------------------------------------------------
+  # Loop through each Seurat object in seurat_list
+  # --------------------------------------------------------------------------
+  for (i in seq_along(seurat_list)) {
+    
+    sample_name <- names(seurat_list)[i]
+    message("Running doublet detection on sample: ", sample_name)
+
+    # Retrieve the current Seurat object
+    seurat_obj <- seurat_list[[i]]
+
+    # ------------------------------------------------------------------------
+    # 1. Perform a standard Seurat workflow
+    # ------------------------------------------------------------------------
+    seurat_obj <- SCTransform(seurat_obj, vst.flavor = "v1")
+    seurat_obj <- RunPCA(seurat_obj)
+    seurat_obj <- RunUMAP(seurat_obj, reduction = "pca", dims = 1:30)
+    seurat_obj <- FindNeighbors(seurat_obj, reduction = "umap", dims = 1:2, force.recalc = TRUE)
+    seurat_obj <- FindClusters(seurat_obj, resolution = 0.05)
+
+    # ------------------------------------------------------------------------
+    # 2. Identify the optimal pK 
+    # ------------------------------------------------------------------------
+    sweep_list  <- paramSweep(seurat_obj, PCs = 1:30, sct = TRUE)
+    sweep_stats <- summarizeSweep(sweep_list)
+    bcmvn       <- find.pK(sweep_stats)
+
+    # pK that maximizes the BCmetric (bimodality coefficient) is considered optimal
+    bcmvn_max  <- bcmvn[which.max(bcmvn$BCmetric), ]
+    optimal_pk <- bcmvn_max$pK
+    # If pK is a factor, convert to numeric
+    optimal_pk <- as.numeric(levels(optimal_pk))[optimal_pk]
+    # message("Optimal pK: ", optimal_pk)
+
+    # ------------------------------------------------------------------------
+    # 3. Estimate homotypic doublets using modelHomotypic
+    # ------------------------------------------------------------------------
+    seu_clusters    <- seurat_obj@meta.data$seurat_clusters
+    homotypic_prop <- modelHomotypic(seu_clusters)
+
+    # ------------------------------------------------------------------------
+    # 4. Calculate expected #doublets (nExp.poi):
+    #    base_rate * (n_cells / 1,000)
+    #    Then multiply that fraction by total number of cells
+    # ------------------------------------------------------------------------
+    n_cells     <- ncol(seurat_obj)  # number of cells in the sample
+    sample_rate <- base_rate * (n_cells / 1000)
+    nExp.poi    <- round(sample_rate * n_cells)
+    # message("Estimated doublet rate (%): ", round(sample_rate * 100, 2))
+    # message("Expected number of doublets (nExp.poi): ", nExp.poi)
+
+    # Adjust for homotypic doublets
+    nExp.poi.adj <- round(nExp.poi * (1 - homotypic_prop))
+    # message("Adjusted expected doublets (nExp.poi.adj): ", nExp.poi.adj)
+
+    # ------------------------------------------------------------------------
+    # 5. Run DoubletFinder with the identified parameters
+    # ------------------------------------------------------------------------
+    seurat_obj <- doubletFinder(
+      seurat_obj, 
+      PCs        = 1:30, 
+      pN         = 0.25,  # recommended default
+      pK         = optimal_pk, 
+      nExp       = nExp.poi.adj,
+      reuse.pANN = FALSE,  # first run of DoubletFinder
+      sct        = TRUE
+    )
+
+    # Store the updated Seurat object back
+    seurat_list[[i]] <- seurat_obj
+  }
+
+  # Return the updated list of Seurat objects
+  return(seurat_list)
+}
+# ------------------------------------------------------------------------------
+# Example usage 
+# ------------------------------------------------------------------------------
+# mouse_doublets <- detect_doublets(seurat_list = mouse_list, base_rate = 0.008)
+# human_doublets <- detect_doublets(seurat_list = human_list, base_rate = 0.008)
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# Save the doublet annotated objects
+# ------------------------------------------------------------------------------
+# saveRDS(mouse_doublets, file = file.path(mouse_save_path, "mouse_doublets.rds"))
+#saveRDS(human_doublets, file = file.path(human_save_path, "human_doublets.rds"))
+```
+
+
+## 1.4 Merge all Seurat objects (i.e., samples) into a single Seurat object
+```{r}
+# Load the RDS files
+mouse_doublets <- readRDS(file.path(mouse_save_path, "mouse_doublets.rds"))
+# human_doublets <- readRDS(file.path(human_save_path, "human_doublets.rds"))
+```
+
+```{r}
+#' This function prepares a list of Seurat objects for merging by cleaning metadata,
+#' setting RNA as the default assay, and removing the SCT assay generated after SoupX 
+#' and DoubletFinder pre-processing steps.
+#'
+#' @param seurat_obj (Seurat) : A Seurat object to be prepared for merging.
+#' @return (Seurat)           : The cleaned and standardized Seurat object ready for merging.
+#' @export
+prepare_seurat_for_merge <- function(seurat_obj) {
+  # --------------------------------------------------------------------------
+  # Prepare Seurat list for merging
+  # 1. Remove redundant columns from metadata:
+  #    - Remove unnecessary columns to optimize dataset size for merging.
+  # 2. Standardize column names:
+  #    - Ensure consistent naming for DF.classifications columns across datasets.
+  # 3. Set Default Assay to RNA and remove SCT Assay:
+  #    - Ensure Seurat objects have the same features before merging.
+  # --------------------------------------------------------------------------
+
+  # Clean Metadata: Remove redundant columns and standardize column names
+  metadata <- seurat_obj@meta.data
+  metadata <- metadata[, !colnames(metadata) %in% "seurat_clusters"]
+  remove_cols <- grep("SCT|pANN", colnames(metadata), value = TRUE)
+  metadata <- metadata[, !colnames(metadata) %in% remove_cols]
+  colnames(metadata) <- sub("DF.classifications.*", "doublet_finder", colnames(metadata))
+  seurat_obj@meta.data <- metadata
+
+  # Set RNA as Default Assay
+  DefaultAssay(seurat_obj) <- "RNA"
+
+  # Remove SCT Assay
+  seurat_obj[["SCT"]] <- NULL
+
+  return(seurat_obj)
+}
+# ------------------------------------------------------------------------------
+# Example usage 
+# ------------------------------------------------------------------------------
+# mouse_doublets <- lapply(mouse_doublets, prepare_seurat_for_merge)
+# human_doublets <- lapply(human_doublets, prepare_seurat_for_merge)
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# Merge all Seurat objects from a list of Seurat objects
+# ------------------------------------------------------------------------------
+merge_all_samples <- function(species_list) {
+  samples_names <- names(species_list)
+  merged_object <- Merge_Seurat_List(species_list,
+                                     add.cell.ids = samples_names,
+                                     project = "sc2atlas",
+                                     merge.data = TRUE)
+  # Set cell identity class 
+  Idents(merged_object) <- "orig.ident"
+
+  # Return the merged Seurat object
+  return(merged_object)
+}
+# ----------------------------------------------------------------------------
+# Example usage 
+# ----------------------------------------------------------------------------
+# merged_mouse <- merge_all_samples(species_list = mouse_doublets)
+# merged_human <- merge_all_samples(species_list = human_doublets)
+```
+
+```{r}
+# Create a table summarizing singlets and doublets per sample
+table(merged_mouse@meta.data$orig.ident, merged_mouse@meta.data$doublet_finder)
+# table(merged_human@meta.data$orig.ident, merged_human@meta.data$doublet_finder)
+```
+
+## 1.5 Filtering of cells and genes based on quality control (QC) metrics
+### 1.5.1 Cells filtering
+#### 1.5.1.a QC metrics before filtering
+```{r}
+#-------------------------------------------------------------------------------
+# Visualize QC Metrics Before Filtering: 
+# QC metrics for cells: Number of genes, number of transcripts, and % mitochondrial transcripts.
+#-------------------------------------------------------------------------------
+
+# First calculate percentage of mitochondrial transcripts for each cell
+merged_mouse[["percent_mito"]] <- PercentageFeatureSet(merged_mouse, pattern = "^mt-") 
+# merged_human[["percent_mito"]] <- PercentageFeatureSet(merged_human, pattern = "^MT-")
+
+#-------------------------------------------------------------------------------
+# Violin Plots 
+#-------------------------------------------------------------------------------
+
+# Plot the QC metrics for cells
+plt <- QC_Plots_Combined_Vln(merged_mouse,  # or merged_human
+                            mito_name = "percent_mito",
+                            feature_cutoffs = 200,
+                            UMI_cutoffs = 200,
+                            mito_cutoffs = 10,
+                            pt.size = 0,
+                            plot_median = TRUE,
+                            median_size = 5) 
+plt
+# Save 
+ggsave(filename = file.path(mouse_path_figures,  # or human_path_figures
+                            "QC_violin_plot.png"), plot = plt, width = 16, height = 10)
+
+#-------------------------------------------------------------------------------
+# Scatterplots 
+#-------------------------------------------------------------------------------
+
+# Scatter: Number of genes vs. number of transcripts
+scatter1 <- QC_Plot_UMIvsGene(merged_mouse,  # or merged_human
+                        low_cutoff_gene = 200,
+                        low_cutoff_UMI = 200)
+
+# Scatter: Number of genes vs. % mitochondrial transcripts
+scatter2 <- QC_Plot_GenevsFeature(merged_mouse,  # or merged_human
+                            feature1 = "percent_mito", 
+                            low_cutoff_gene = 200, 
+                            high_cutoff_feature = 10)
+
+# Scatter: Color-coded by % mitochondrial transcripts
+scatter3 <- QC_Plot_UMIvsGene(merged_mouse,  # or merged_human
+                        meta_gradient_name = "percent_mito", 
+                        low_cutoff_gene = 200,
+                        low_cutoff_UMI = 200)
+
+# Scatter: Color-coded by % mitochondrial transcripts with a cutoff of 10%
+scatter4 <- QC_Plot_UMIvsGene(merged_mouse,  #or merged_human
+                        meta_gradient_name = "percent_mito", 
+                        low_cutoff_gene = 200,
+                        low_cutoff_UMI = 200,
+                        meta_gradient_low_cutoff = 10)
+
+#-------------------------------------------------------------------------------
+# Combine Plots for Visualization
+#-------------------------------------------------------------------------------
+combined_plot <- wrap_plots(
+  wrap_plots(scatter1, scatter2), 
+  wrap_plots(scatter3, scatter4), 
+  nrow = 2
+)
+combined_plot
+# Save 
+ggsave(filename = file.path(mouse_path_figures,  # or human_path_figures
+                            "QC_combined_scatterplots.png"), plot = combined_plot, width = 16, height = 10)
+```
+
+#### 1.5.1.b QC metrics after filtering 
+```{r}
+#-------------------------------------------------------------------------------
+# Visualize QC Metrics After Filtering: 
+#-------------------------------------------------------------------------------
+#
+#' This function filters cells based on ±3 MAD for nCount_RNA and nFeature_RNA within each sample,
+#' in addition to DoubletFinder classification, mitochondrial transcripts percentage per cell, and minimum gene count per cell.
+#'
+#' @param merged_obj (Seurat) : A merged Seurat object (e.g., merged_mouse, merged_human).
+#' @return           (Seurat) : The filtered merged Seurat object retaining only cells that pass all criteria.
+#' @export
+filter_cells <- function(merged_obj) {
+ #------------------------------------------------------------------------------
+ # Filtering criteria : 
+ #   - Cells must be classified as "Singlet" by DoubletFinder
+ #   - Mitochondrial percentage < 5%
+ #   - Detected genes (nFeature_RNA) > 200
+ #   - Cells must be within ±3 Median Absolute Deviations (MAD) for nCount_RNA (UMIs)
+ #     and nFeature_RNA (genes) per sample
+ #------------------------------------------------------------------------------
+  
+  # 1. Compute median (med_umi, med_genes) and ±3 MAD (mad_umi, mad_genes) per sample
+  unique_samples <- unique(merged_obj$orig.ident)
+  
+  # Prepare columns to store the MAD filtering results
+  merged_obj$within_3mad_umi <- NA
+  merged_obj$within_3mad_genes <- NA
+  
+  for (sample_id in unique_samples) {
+    # Identify the indices of cells from this sample
+    idx <- which(merged_obj$orig.ident == sample_id)
+    
+    # Extract the UMI and gene counts for just these cells
+    umi_values   <- merged_obj$nCount_RNA[idx]
+    gene_values  <- merged_obj$nFeature_RNA[idx]
+    
+    # Compute median and MAD for UMIs
+    med_umi <- median(umi_values)
+    mad_umi <- mad(umi_values)  # median absolute deviation
+    
+    # Compute ±3 MAD bounds
+    umi_lower <- med_umi - 3 * mad_umi
+    umi_upper <- med_umi + 3 * mad_umi
+    
+    # Compute median and MAD for genes
+    med_gene <- median(gene_values)
+    mad_gene <- mad(gene_values)
+    
+    # Compute ±3 MAD bounds
+    gene_lower <- med_gene - 3 * mad_gene
+    gene_upper <- med_gene + 3 * mad_gene
+    
+    # Determine which cells fall within ±3 MAD of the median for both UMIs and genes
+    merged_obj$within_3mad_umi[idx]   <- umi_values >= umi_lower & umi_values <= umi_upper
+    merged_obj$within_3mad_genes[idx] <- gene_values >= gene_lower & gene_values <= gene_upper
+  }
+  
+  # 2. Combine the ±3 MAD filters with the other QC criteria
+  merged_obj$keep <- (
+    merged_obj$doublet_finder == "Singlet" &
+    merged_obj$percent_mito < 5 &
+    merged_obj$nFeature_RNA > 200 &
+    merged_obj$within_3mad_umi &
+    merged_obj$within_3mad_genes
+  )
+  
+  merged_obj$within_3mad_umi   <- NULL
+  merged_obj$within_3mad_genes <- NULL
+  
+  # 3. Subset the Seurat object to include only cells that pass all criteria
+  merged_obj <- subset(merged_obj, subset = keep == TRUE)
+  
+  return(merged_obj)
+}
+
+# ------------------------------------------------------------------------------
+# Example usage 
+# ------------------------------------------------------------------------------
+# merged_mouse <- filter_cells(merged_mouse)
+# merged_human <- filter_cells(merged_human)
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# Violin Plot After Filtering
+#-------------------------------------------------------------------------------
+
+plt_post <- QC_Plots_Combined_Vln(
+  merged_mouse, 
+  mito_name = "percent_mito", 
+  feature_cutoffs = 200, 
+  UMI_cutoffs = 200, 
+  mito_cutoffs = 5, 
+  pt.size = 0, 
+  plot_median = TRUE, 
+  median_size = 5
+)
+plt_post
+ggsave(filename = file.path(mouse_path_figures, 
+                       "QC_violin_plot_post_filtering.png"), plot = plt_post, width = 16, height = 10)
+
+#-------------------------------------------------------------------------------
+# Scatterplots After Filtering
+#-------------------------------------------------------------------------------
+
+scatter1_post <- QC_Plot_UMIvsGene(
+  merged_mouse, 
+  low_cutoff_gene = 200, 
+  low_cutoff_UMI = 200
+)
+
+scatter2_post <- QC_Plot_GenevsFeature(
+  merged_mouse, 
+  feature1 = "percent_mito", 
+  low_cutoff_gene = 200, 
+  high_cutoff_feature = 5
+)
+
+scatter3_post <- QC_Plot_UMIvsGene(
+  merged_mouse, 
+  meta_gradient_name = "percent_mito", 
+  low_cutoff_gene = 200, 
+  low_cutoff_UMI = 200
+)
+
+scatter4_post <- QC_Plot_UMIvsGene(
+  merged_mouse, 
+  meta_gradient_name = "percent_mito", 
+  low_cutoff_gene = 200, 
+  low_cutoff_UMI = 200, 
+  meta_gradient_low_cutoff = 5
+)
+
+#-------------------------------------------------------------------------------
+# Combine Scatterplots After Filtering
+#-------------------------------------------------------------------------------
+combined_plot_post <- wrap_plots(
+  wrap_plots(scatter1_post, scatter2_post), 
+  wrap_plots(scatter3_post, scatter4_post), 
+  nrow = 2
+)
+combined_plot_post
+# Save the Combined Scatterplots
+ggsave(filename = file.path(mouse_path_figures, 
+                       "QC_combined_scatterplots_post_filtering.png"), plot = combined_plot_post, width = 16, height = 10)
+```
+
+```{r}
+# # Check the number of cells per sample after filtering
+table(merged_mouse@meta.data$orig.ident)
+# table(merged_human@meta.data$orig.ident)
+```
+
+### 1.5.2 Genes filtering 
+NB: 
+Skip this step. 
+The code for this step needs to be changed to be fully functional.
+Moreover, gene filtering is not strictly necessary before performing SCTransform and PCA:
+  - SCTransform automatically selects the top variable genes (e.g., ~3,000), excluding lowly expressed or unexpressed genes.
+  - PCA uses only this subset of highly variable genes, so lowly expressed genes do not affect dimensionality reduction.
+Keeping all genes ensures consistency across samples, though it may slightly increase memory usage.
+Yet, needs to be discussed with Steven.
+```{r}
+#-------------------------------------------------------------------------------
+#   QC metrics for genes: Number of cells expressing each gene per sample.
+#-------------------------------------------------------------------------------
+#
+##' Filter genes by minimum cell presence (default = 10) per sample, then re-merge.
+##' 
+##' @param seurat_list (list)  : A list of Seurat objects split by sample.
+##' @param skip_sample (char)  : Sample name to skip for gene filtering (default is the ADT sample).
+##' @return           (Seurat) : The merged Seurat object after genes filtering.
+##' @export
+#filter_genes_per_sample <- function(seurat_list, skip_sample = "KNAF4_En1Sun1GFPNeuN_CITEseq") {
+#  
+#  # Prepare a list to store filtered objects
+#  filtered_objects_list <- list()
+#  
+#  # ---------------------------------------------------------------------------
+#  # Filter genes in each sample
+#  #    - Keep genes detected (count > 0) in at least 10 cells.
+#  # ---------------------------------------------------------------------------
+#  for (sample_id in names(seurat_list)) {
+#    sample_obj <- seurat_list[[sample_id]]
+#    
+#    # Skip gene filtering if it's the ADT+RNA sample
+#    if (sample_id == skip_sample) {
+#      filtered_objects_list[[sample_id]] <- sample_obj
+#      next
+#    }
+#
+#    # Retrieve the counts from the RNA assay
+#    counts_rna <- GetAssayData(sample_obj, assay = "RNA", layer = "counts")
+#    
+#    # Identify genes that are present in ≥ 10 cells
+#    genes_keep <- rowSums(counts_rna > 0) >= 10
+#
+#    # Subset the Seurat object to keep only the filtered RNA genes & ADT features
+#    sample_obj <- subset(sample_obj, features = names(which(genes_keep)))
+#    
+#    # Store the filtered sample
+#    filtered_objects_list[[sample_id]] <- sample_obj
+#  }
+#  
+#  # ---------------------------------------------------------------------------
+#  # 2. Re-merge all filtered sample objects
+#  # ---------------------------------------------------------------------------
+#  merged_filtered_obj <- merge_all_samples(filtered_objects_list)
+#  
+#  # Return the re-merged filtered Seurat object
+#  return(merged_filtered_obj)
+#}
+# ------------------------------------------------------------------------------
+# Example usage: Split the merged object first, then pass the list to the function
+# ------------------------------------------------------------------------------
+#seurat_list_mouse <- SplitObject(merged_mouse, split.by = "orig.ident")
+# Filter genes per sample, skipping the ADT+RNA sample
+#filtered_merged_mouse <- filter_genes_per_sample(seurat_list = seurat_list_mouse)
+#
+# seurat_list_human <- SplitObject(merged_human, split.by = "orig.ident")
+# filtered_merged_human <- filter_genes_per_sample(seurat_list = seurat_list_human)
+```
+
+
+```{r}
+# ------------------------------------------------------------------------------
+# Save the filtered merged object
+# ------------------------------------------------------------------------------
+saveRDS(merged_mouse, file = file.path(mouse_save_path, "mouse_merged_filtered.rds"))
+# saveRDS(merged_human, file = file.path(human_save_path, "human_merged_filtered.rds"))
+```
+
+
+# 2. Processing
+```{r}
+#-------------------------------------------------------------------------------
+# Define the general paths to save and load the data
+#-------------------------------------------------------------------------------
+mouse_save_path <- file.path(getwd(), "..", "Rdata", "mouse", "all_cells")
+human_save_path <- file.path(getwd(), "..", "Rdata", "human", "all_cells")
+
+#-------------------------------------------------------------------------------
+# Define the general paths to save the figures
+#-------------------------------------------------------------------------------
+mouse_path_figures <- file.path(getwd(), "..", "figures", "mouse", "all_cells")
+human_path_figures <- file.path(getwd(), "..", "figures", "human", "all_cells")
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# Function for plots general customization
+# ------------------------------------------------------------------------------
+
+#' @title Apply a custom ggplot2 theme to a ggplot (or patchwork) object.
+#'
+#' @description This function takes a ggplot object (e.g., a Seurat DimPlot)
+#' and applies a custom theme with a custom title, centered plot title, etc.
+#'
+#' @param plot  A ggplot2 object (e.g., output from DimPlot, FeaturePlot).
+#' @param title The title to assign to the plot.
+#'
+#' @return A ggplot2 plot object with a customized theme applied.
+#'
+#' @export
+apply_theme <- function(plot, title) {
+  plot +
+    ggtitle(title) +
+    theme_gray() +
+    theme(
+      plot.title  = element_text(hjust = 0.5),
+      axis.text.x = element_text(face = "bold"),
+      axis.text.y = element_text(face = "bold")
+    )
+}
+```
+
+```{r}
+# Load the RDS files
+merged_mouse <- readRDS(file.path(mouse_save_path, "all_samples", "mouse_merged_filtered.rds"))
+# merged_human <- readRDS(file.path(human_save_path, "all_samples", "human_merged_filtered.rds"))
+```
+
+## 2.1 RNA counts: Normalization and dimensionality reduction
+```{r}
+#------------------------------------------------------------------------------
+# Function: Calculate Optimal Principal Components (PCs)
+#------------------------------------------------------------------------------
+
+#' @title Calculate Optimal Principal Components
+#'
+#' @description This function determines the optimal number of PCs to use for UMAP and integration based on two criteria:
+#' (1) The first PC where cumulative variance exceeds 90% and individual variance contribution is < 5%.
+#' (2) The first major drop in variance contribution greater than 0.1%.
+#' It returns the average of the two criteria and prints the chosen PC number.
+#' Criterion 1 evaluates an absolute contribution, while Criterion 2 assesses relative changes between PCs.
+#'
+#' @param merged_obj (Seurat).    : A Seurat object containing PCA results.
+#' @return (numeric)              : The average of the PC numbers determined by the two criteria, rounded to the nearest integer.
+#' @export
+calculate_optimal_pcs <- function(merged_obj) {
+  # Extract standard deviations of principal components
+  stdv <- merged_obj[["pca"]]@stdev
+
+  # Total variance explained by all components
+  sum_stdv <- sum(stdv)
+
+  # Percentage variance explained by each component
+  percent_stdv <- (stdv / sum_stdv) * 100
+
+  # Cumulative variance explained
+  cumulative <- cumsum(percent_stdv)
+
+  # Criterion 1: First PC where cumulative variance > 90% and individual variance < 5%
+  col1 <- which(cumulative > 90 & percent_stdv < 5)[1]
+
+  # Criterion 2: First major drop in variance contribution > drop_threshold
+  drops <- percent_stdv[1:(length(percent_stdv) - 1)] - percent_stdv[2:length(percent_stdv)]
+  drop_threshold = 0.1
+  col2 <- which(drops > drop_threshold)[1] + 1
+
+  # Average the two criteria
+  optimal_pc <- round(mean(c(col1, col2)), 0)
+
+  # Print the optimal PC number
+  cat("Optimal number of PCs:", optimal_pc, "\n")
+
+  return(optimal_pc)
+}
+
+#-------------------------------------------------------------------------------
+# Function: Process a Merged Seurat Object
+#-------------------------------------------------------------------------------
+
+#' @title Process a Merged Seurat Object
+#'
+#' @description This function performs SCTransform, PCA, and UMAP on a merged Seurat object.
+#' The number of PCs for UMAP is determined using the `calculate_optimal_pcs` function.
+#'
+#' @param merged_obj (Seurat)  : A merged Seurat object (e.g., merged_mouse, merged_human).
+#' @return (Seurat)            : The processed Seurat object with PCA and UMAP embeddings.
+#' @export
+process_merged_object <- function(merged_obj) {
+  # Perform SCTransform
+  # Transformed data will be available in the SCT assay 
+  # which is set as default assay after running SCTransform
+  merged_obj <- SCTransform(merged_obj, vst.flavor = "v1")
+
+  # Run PCA
+  # Uses the scaled data (scale.data) from the active assay (SCT)
+  merged_obj <- RunPCA(merged_obj)
+
+  # Calculate optimal number of PCs for UMAP
+  optimal_pcs <- calculate_optimal_pcs(merged_obj)
+
+  # Run UMAP using the optimal number of PCs
+  merged_obj <- RunUMAP(merged_obj, reduction = "pca", dims = 1:optimal_pcs)
+
+  return(merged_obj)
+}
+
+#-------------------------------------------------------------------------------
+# Example Usage
+#-------------------------------------------------------------------------------
+# merged_mouse <- process_merged_object(merged_mouse)
+# merged_human <- process_merged_object(merged_human)
+```
+
+
+```{r}
+# UMAP visualization
+# Group by samples
+p1 <- apply_theme(DimPlot(merged_mouse, # or merged_human
+                                   reduction = "umap", group.by = "orig.ident"), "Cells distribution per sample - Pre-integration")
+p1
+# Split by samples
+p2 <- apply_theme(DimPlot(merged_mouse, # or merged_human
+                                   reduction = "umap", split.by = "orig.ident"), "Cells distribution per sample - Pre-integration")
+p2
+
+# Save
+ggsave(filename = file.path(mouse_path_figures, # or human_path_figures
+                       "all_samples",
+                       "cells_distribution_grouped_preintegration.png"), plot = p1, width = 10, height = 8)
+ggsave(filename = file.path(mouse_path_figures, # or human_path_figures
+                       "all_samples",
+                       "cells_distribution_splited_preintegration.png"), plot = p2, width = 20, height = 10)
+```
+
+## 2.1 Antibody (GFP-TotalSeqC) counts: Normalization and threshold
+NB:
+- Since we have only one feature (GFP) and only one citeseq sample, normalizing the counts might be unnecessary. 
+- Yet, we can consider normalizing the antibody counts across the cells instead (needs to be discussed with Steven).
+- Since Seurat does not provide a built-in function to normalize unidimensional ADT data (only bidimensional), we will create a custom function to perform this normalization.
+
+```{r}
+# Change to the Antibody assay
+DefaultAssay(merged_mouse) <- "Antibody"
+DefaultAssay(merged_mouse)
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# Function: Normalize Antibody Counts
+#-------------------------------------------------------------------------------
+#' @title Normalize Antibody Counts
+#'
+#' @description This function performs centered log-ratio (CLR) normalization on unidimensional antibody assay. It adjusts the antibody counts across cells.
+#'
+#' @param object (Seurat).  : A Seurat object containing the antibody assay.
+#' @param assay  (character): The name of the assay to normalize (e.g., "Antibody").
+#' @return (Seurat)         : The Seurat object with normalized antibody assay stored in the "data" slot of the specified assay.
+#' @export
+NormalizeADTData <- function(object, assay = NULL) {
+  # Access the antibody counts
+  counts <- GetAssayData(object = object[[assay]], layer = "counts")
+
+  # Perform CLR normalization for unidimensional data
+  # Calculate the geometric mean using non-zero values only
+  non_zero_counts <- counts[counts > 0]
+  geo_mean <- exp(mean(log1p(non_zero_counts)))
+
+  # Normalize counts
+  normalized_counts <- log1p(counts / geo_mean)
+
+  # Update the data slot with the normalized counts
+  object[[assay]] <- SetAssayData(
+    object = object[[assay]],
+    layer = "data",
+    new.data = Matrix::Matrix(normalized_counts, sparse = TRUE)
+  )
+
+  # Log command for reproducibility
+  object <- LogSeuratCommand(object)
+
+  return(object)
+}
+
+#-------------------------------------------------------------------------------
+# Example Usage
+#-------------------------------------------------------------------------------
+# merged_mouse <- NormalizeADTData(merged_mouse, assay = "Antibody")
+```
+
+```{r}
+# UMAP visualization
+p1 <- apply_theme(FeaturePlot(merged_mouse, features = "GFP-TotalSeqC", reduction = "umap"), "GFP-TotalSeqC expression across cells - Post-normalization")
+p1
+p2 <- apply_theme(FeaturePlot_scCustom(merged_mouse, features = "GFP-TotalSeqC", reduction = "umap"), "GFP-TotalSeqC expression across cells - Post-normalization")
+p2
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# GFP-TotalSeqC expression 
+#-------------------------------------------------------------------------------
+# Fetching data for GFP-TotalSeqC across all cells in non-normalized data (counts)
+gfp_expression <- FetchData(merged_mouse, vars = "GFP-TotalSeqC", layer = "counts")
+
+# Fetching data for GFP-TotalSeqC across all cells in normalized data (data)
+gfp_expression_norm <- FetchData(merged_mouse, vars = "GFP-TotalSeqC", layer = "data")
+
+#-------------------------------------------------------------------------------
+# Updating column names for clarity
+#-------------------------------------------------------------------------------
+# Change the name of the column to "GFP" for easier reference
+colnames(gfp_expression) <- "GFP"
+colnames(gfp_expression_norm) <- "GFP"
+
+#-------------------------------------------------------------------------------
+# Identifying cells with no GFP-TotalSeqC expression
+#-------------------------------------------------------------------------------
+# Cells with no GFP-TotalSeqC expression in non-normalized data
+cells_no_gfp <- rownames(gfp_expression[gfp_expression$GFP == 0, , drop = FALSE])
+
+# Cells with no GFP-TotalSeqC expression in normalized data
+cells_no_gfp_norm <- rownames(gfp_expression_norm[gfp_expression_norm$GFP == 0, , drop = FALSE])
+
+length(cells_no_gfp) # only 1
+length(cells_no_gfp_norm) # only 1
+
+#-------------------------------------------------------------------------------
+# Summary of GFP-TotalSeqC expression
+#-------------------------------------------------------------------------------
+summary(gfp_expression$GFP)
+summary(gfp_expression_norm$GFP)
+
+#-------------------------------------------------------------------------------
+# Counting cells below specific GFP-TotalSeqC expression thresholds
+#-------------------------------------------------------------------------------
+
+# Non-normalized data: Number of cells with GFP expression below thresholds
+sum(gfp_expression$GFP < 10) # 19 cells
+sum(gfp_expression$GFP < 5)  # 7 cells
+
+# Normalized data: Number of cells with GFP expression below thresholds
+sum(gfp_expression_norm$GFP < 0.05) # 9 cells
+sum(gfp_expression_norm$GFP < 0.1)  # 21 cells
+sum(gfp_expression_norm$GFP < 0.2)  # 73 cells
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# Add new column to metadata with GFP-TotalSeqC expression
+#-------------------------------------------------------------------------------
+merged_mouse <- AddMetaData(merged_mouse, metadata = gfp_expression_norm, col.name = "GFP")
+
+#-------------------------------------------------------------------------------
+# Filter cells from KNAF4_En1Sun1GFPNeuN_CITEseq sample where GFP < 0.05
+#-------------------------------------------------------------------------------
+merged_mouse <- subset(merged_mouse, subset = GFP > 0.05 | orig.ident != "KNAF4_En1Sun1GFPNeuN_CITEseq")
+
+table(merged_mouse@meta.data$orig.ident)
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# Save the processed merged objects
+# ------------------------------------------------------------------------------
+saveRDS(merged_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_processed.rds"))
+# saveRDS(merged_human, file = file.path(human_save_path, "all_samples", "human_processed.rds"))
+```
+
+# 3. Integration and clustering
+## 3.1 Join layers of objects that correspond to same biological sample (CITE-seq samples only)
+```{r}
+# Load the RDS file
+mouse_doublets <- readRDS(file.path(mouse_save_path,"mouse_doublets.rds"))
+```
+
+Before performing integration, the datasets that comes from the same biological sample (i.e., KNAF3 & KNAF4) needs to be joined.
+```{r}
+# ------------------------------------------------------------------------------
+# For Mouse CITE-seq samples only:
+# - Join counts layers of objects that correspond to same sample 
+# ------------------------------------------------------------------------------
+# 1. Extract the datasets that correspond to the same biological sample
+knaf3 <- mouse_doublets[["KNAF3_En1Sun1NeuN"]]
+knaf4 <- mouse_doublets[["KNAF4_En1Sun1GFPNeuN_CITEseq"]]
+
+# # 2. Remove these datasets from the samples list
+# mouse_doublets[["KNAF3_En1Sun1NeuN"]] <- NULL
+# mouse_doublets[["KNAF4_En1Sun1GFPNeuN_CITEseq"]] <- NULL
+
+# 3. Store these datasets in a list
+knaf_list <- list(knaf3, knaf4)
+names(knaf_list) <- c("KNAF3_En1Sun1NeuN", "KNAF4_En1Sun1GFPNeuN_CITEseq")
+
+# 4. Prepare the objects for merging
+mouse_doublets <- lapply(mouse_doublets, prepare_seurat_for_merge)
+knaf_list <- lapply(knaf_list, prepare_seurat_for_merge)
+
+# # 5. Merge the objects of each list
+# merged_1 <- merge_all_samples(mouse_doublets)
+merged_2 <- merge_all_samples(knaf_list)
+
+# 6. Join the layer of merged_2 (i.e., knafo datasets)
+# merged_2[["RNA"]] <- JoinLayers(merged_2[["RNA"]])
+
+# # 7. Merge the two merged objects
+# merged_mouse <- merge(x = merged_1, y = merged_2)
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# - Perform the filtering and processing steps on the new re-merged object
+# ------------------------------------------------------------------------------
+# 1. Filtering
+merged_mouse[["percent_mito"]] <- PercentageFeatureSet(merged_mouse, pattern = "^mt-") 
+merged_mouse <- filter_cells(merged_mouse)
+
+# 2. Processing
+## 2.1 RNA counts
+merged_mouse <- process_merged_object(merged_mouse)
+
+## 2.2 Antibody counts
+merged_mouse <- NormalizeADTData(merged_mouse, assay = "Antibody")
+
+### 2.2.1 Add new column to metadata with GFP-TotalSeqC expression
+gfp_expression_norm <- FetchData(merged_mouse, vars = "GFP-TotalSeqC", layer = "data")
+merged_mouse <- AddMetaData(merged_mouse, metadata = gfp_expression_norm, col.name = "GFP")
+
+### 2.2.2 Filter cells from CITE-seq sample where GFP < 0.05
+merged_mouse <- subset(merged_mouse, subset = GFP > 0.05 | orig.ident != "KNAF4_En1Sun1GFPNeuN_CITEseq")
+
+# 3. Update sample identifiers in metadata
+merged_mouse$orig.ident[merged_mouse$orig.ident %in% c("KNAF3_En1Sun1NeuN", "KNAF4_En1Sun1GFPNeuN_CITEseq")] <- "KNAF3-4_En1Sun1NeuN-GFP"
+```
+```{r}
+# ------------------------------------------------------------------------------
+# - Perform the filtering and processing steps on the new re-merged object
+# ------------------------------------------------------------------------------
+# 1. Filtering
+merged_2[["percent_mito"]] <- PercentageFeatureSet(merged_2, pattern = "^mt-") 
+merged_2 <- filter_cells(merged_2)
+
+# 2. Processing
+## 2.1 RNA counts
+merged_2 <- process_merged_object(merged_2)
+
+## 2.2 Antibody counts
+merged_2 <- NormalizeADTData(merged_2, assay = "Antibody")
+
+### 2.2.1 Add new column to metadata with GFP-TotalSeqC expression
+gfp_expression_norm <- FetchData(merged_2, vars = "GFP-TotalSeqC", layer = "data")
+merged_2 <- AddMetaData(merged_2, metadata = gfp_expression_norm, col.name = "GFP")
+
+### 2.2.2 Filter cells from CITE-seq sample where GFP < 0.05
+# merged_2<- subset(merged_2, subset = GFP > 0.05 | orig.ident != "KNAF4_En1Sun1GFPNeuN_CITEseq")
+
+# 3. Update sample identifiers in metadata
+# merged_2$orig.ident[merged_2$orig.ident %in% c("KNAF3_En1Sun1NeuN", "KNAF4_En1Sun1GFPNeuN_CITEseq")] <- "KNAF3-4_En1Sun1NeuN-GFP"
+```
+
+## 3.2 Integration 
+```{r}
+#-------------------------------------------------------------------------------
+# Function: Perform Anchors-Based RPCA Integration
+#-------------------------------------------------------------------------------
+
+#' @title Perform anchors-based RPCA integration
+#'
+#' @description This function integrates datasets using RPCA, calculates the optimal number of PCs and performs UMAP on the integrated data.
+#'
+#' @param seurat_obj (Seurat) : A Seurat object with merged datasets for integration.
+#' @return (Seurat)           : The processed and integrated Seurat object.
+#' @export
+perform_integration <- function(seurat_obj) {
+  # 1. Perform RPCA integration
+  seurat_obj <- IntegrateLayers(seurat_obj, method = RPCAIntegration, orig.reduction = "pca", new.reduction = "integrated.rpca", normalization.method = "SCT")
+  
+  # 2. Calculate optimal number of PCs 
+  optimal_pcs <- calculate_optimal_pcs(seurat_obj)
+  
+  # 3. Perform UMAP on the integrated data
+  seurat_obj <- RunUMAP(seurat_obj, reduction = "integrated.rpca", dims = 1:optimal_pcs, reduction.name = "umap.rpca")
+  
+  return(seurat_obj)
+}
+
+#-------------------------------------------------------------------------------
+# Example Usage
+#-------------------------------------------------------------------------------
+# merged_mouse <- perform_integration(merged_mouse)
+
+# Load human processed object
+# merged_human <- readRDS(file.path(human_save_path, "all_samples", "human_processed.rds"))
+# merged_human <- perform_integration(merged_human)
+```
+
+```{r}	
+# Perform SCT
+merged_2 <- SCTransform(merged_2, assay = "RNA", verbose = FALSE)
+```
+
+```{r}
+# Perform PCA
+merged_2 <- RunPCA(merged_2, verbose = FALSE)
+```
+
+```{r}
+# Perform integration
+merged_2 <- perform_integration(merged_2)
+```
+
+```{r}	
+# Save the integrated objects
+saveRDS(merged_2, file = file.path(mouse_save_path, "knaf3-4_integrated.rds"))
+```
+
+```{r}
+# Visualize clustering of Knaf3-4
+DimPlot(merged_2, reduction = "umap.rpca", group.by = "orig.ident", label = TRUE, repel = TRUE)
+```
+```{r}	
+# Compute neighbors using UMAP reduction
+merged_2 <- FindNeighbors(merged_2, reduction = "umap.rpca", dims = 1:2, force.recalc = TRUE)
+
+# Perform clustering
+merged_2 <- FindClusters(merged_2, resolution = 0.5)  # Adjust resolution for finer/coarser clusters
+
+# Inspect the clustering results
+table(Idents(merged_2))  # View the number of cells in each cluster
+
+# Visualize the clustering
+DimPlot(merged_2, reduction = "umap.rpca", label = TRUE, repel = TRUE)
+```	
+
+```{r}	
+# Compute the proportion of Knaf4 cells in each cluster 
+props <- c()
+
+for (cluster in sort(unique(Idents(merged_2)))) {
+  cat("Cluster", cluster, ":", round(100 * sum(merged_2$orig.ident[Idents(merged_2) == cluster] == "KNAF4_En1Sun1GFPNeuN_CITEseq") / sum(Idents(merged_2) == cluster), 2), "%\n")
+  props <- c(props, round(100 * sum(merged_2$orig.ident[Idents(merged_2) == cluster] == "KNAF4_En1Sun1GFPNeuN_CITEseq") / sum(Idents(merged_2) == cluster), 2))
+}
+
+
+```
+# ```{r}
+# # Label the clusters V1 if proportions higher than 90 % 
+# # Label clusters Neuron Only if less than 10% 
+# # Clusters between 10% and 90% are labeld uncertain
+
+# # Define the labels
+# labels <- ifelse(props > 90, "V1", ifelse(props < 10, "Neuron Only", "Uncertain"))
+
+# # Update the cluster names
+# labels <- factor(labels, levels = c("V1", "Uncertain", "Neuron Only"))
+# names(labels) <- levels(Idents(merged_2))
+
+# # Rename the clusters
+
+# merged_2 <- RenameIdents(merged_2, labels)
+
+# table(Idents(merged_2))
+# ```
+
+```{r}
+# Check the overlapping of knaf4 and V1 cells
+knaf4_cells <- which(merged_2$orig.ident == "KNAF4_En1Sun1GFPNeuN_CITEseq")
+v1_cells <- which(Idents(merged_2) == "V1")
+length(intersect(knaf4_cells, v1_cells))
+
+# Check the overlapping of knaf4 and Neuron Only cells
+neuron_only_cells <- which(Idents(merged_2) == "Neuron Only")
+length(intersect(knaf4_cells, neuron_only_cells))
+
+# Check the overlapping of knaf4 adn Uncertain cells
+uncertain_cells <- which(Idents(merged_2) == "Uncertain")
+length(intersect(knaf4_cells, uncertain_cells))
+
+# Check the overlapping of knaf3 and V1 cells
+knaf3_cells <- which(merged_2$orig.ident == "KNAF3_En1Sun1NeuN")
+length(intersect(knaf3_cells, v1_cells))
+
+# Check the overlapping of knaf3 and Neuron Only cells
+length(intersect(knaf3_cells, neuron_only_cells))
+
+# Check the overlapping of knaf3 and Uncertain cells
+length(intersect(knaf3_cells, uncertain_cells))
+
+# Check the overlapping of V1 and Neuron Only cells
+length(intersect(v1_cells, neuron_only_cells))
+
+```
+
+```{r}	
+# Plot the new clusters
+DimPlot(merged_2, reduction = "umap", label = TRUE, repel = TRUE)
+```
+
+```{r}	
+# Save the integrated objects
+saveRDS(merged_2, file = file.path(mouse_save_path, "knaf3-4_V1_labeled.rds"))
+```
+```{r}
+# UMAP visualization
+# Group by samples
+p1 <- apply_theme(DimPlot(merged_mouse, # or merged_human
+                                   reduction = "umap.rpca", group.by = "orig.ident"), "Cells distribution per sample - Post-integration (RPCA)")
+p1
+# Split by samples
+p2 <- apply_theme(DimPlot(merged_mouse, # or merged_human
+                                   reduction = "umap.rpca", group.by = "orig.ident", split.by = "orig.ident"), "Cells distribution per sample - Post-integration (RPCA)")
+p2
+
+# Save
+ggsave(filename = file.path(mouse_path_figures, # or human_path_figures
+                       "all_samples",
+                       "cells_distribution_grouped_postintegration.png"), plot = p1, width = 10, height = 8)
+ggsave(filename = file.path(mouse_path_figures, # or human_path_figures
+                       "all_samples",
+                       "cells_distribution_splited_postintegration.png"), plot = p2, width = 20, height = 10)
+```
+
+```{r}
+# UMAP visualization
+plt <- apply_theme(FeaturePlot_scCustom(merged_mouse, features = "GFP-TotalSeqC", reduction = "umap.rpca"), "GFP-TotalSeqC expression across cells - Post-integration (RPCA)")
+plt
+
+ggsave(filename = file.path(mouse_path_figures, "all_samples", "GFP_expression_postintegration.png"), plot = plt, width = 10, height = 8)
+```
+
+## 3.3 Graph clustering
+```{r}
+#-------------------------------------------------------------------------------
+# 1. Run FindNeighbors:
+#  - Build the SNN graph on the UMAP space instead of PCA (to avoids mixed clusters)
+#-------------------------------------------------------------------------------
+merged_mouse <- FindNeighbors(merged_mouse, reduction = "umap.rpca", dims = 1:2, force.recalc = T)
+# merged_human <- FindNeighbors(merged_human, reduction = "umap.rpca", dims = 1:2, force.recalc = T)
+
+#-------------------------------------------------------------------------------
+# 2. Run FindClusters:
+#  - Use a small value for resolution to detect main clusters (i.e., main cell types present in the lumbar spinal cord (negative selection))
+#-------------------------------------------------------------------------------
+merged_mouse <- FindClusters(merged_mouse, resolution = 0.05)
+# merged_human <- FindClusters(merged_human, resolution = 0.01)
+```
+
+```{r}
+# UMAP visualization
+plt <- apply_theme(DimPlot_scCustom(merged_mouse, # or merged_human
+                                     reduction = "umap.rpca", group.by = "seurat_clusters", label = TRUE), "Cell clusters - Post-integration (RPCA)")
+plt
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# Save the integrated objects
+# ------------------------------------------------------------------------------
+saveRDS(merged_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_integrated.rds"))
+#saveRDS(merged_human, file = file.path(human_save_path, "all_samples", "human_integrated.rds"))
+```
+
+# 4. Clusters annotation (negative selection)
+```{r}
+# Load the RDS files
+# merged_mouse <- readRDS(file.path(mouse_save_path, "all_samples", "mouse_integrated.rds"))
+# merged_human <- readRDS(file.path(human_save_path, "all_samples", "human_integrated.rds"))
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# Negative selection based on:
+#  - Marker genes for main spinal cord cell types (from literature)
+#-------------------------------------------------------------------------------
+
+# Define main cell types and corresponding genes
+celltype_names <- c(
+  "neurons", "oligodendro", "schwann", "meningo", "astrocytes", "OPC", "microglia", "ependyma", "endothelial"
+)
+
+markers <- list(
+  # Neurons
+  c("Snap25", "Rbfox3", "Syp", "Snhg11"),                 
+  # Oligodendrocytes
+  c("Mobp", "Mog", "Plp1", "Mag", "Mbp"),                 
+  # Schwann
+  c("Mpz", "Pmp22"),                                      
+  # Meningo 
+  c("Dcn", "Col1a2", "Itga10", "Igf2", "Col3a1", 
+    "Col25a1", "Bicc1", "Pdzm3", "Slc47a1"),          
+  # Astrocytes
+  c("Gfap", "Aldh1l1", "Fgfr3", "Col23a", "Aqp4", 
+    "Slc1a2", "Trp63", "Slc7a10", "Atp1a2", "Gja1"), 
+  # OPC
+  c("Vcan", "Pdgfra", "Cspg4", "Gpr17"),                  
+  # Microglia
+  c("Ctss", "Csf1r", "Ptprc", "Itgam", "Ly86", "Myo1f"),  
+  # Ependyma
+  c("Dnah11", "Spag6", "Cfap157", "Dnah12", "Cfap43"),    
+  # Endothelial
+  c("Flt1", "Pecam1", "Pdgfrb", "Notch3", "Abcc9", 
+    "Lyc6c1", "Tek", "Myl9") 
+)
+
+# For human data: Convert gene names in the list to uppercase
+#markers <- lapply(markers, function(genes) {
+  #toupper(genes)
+#})
+
+# Turn them into a named list
+celltype_markers <- setNames(markers, celltype_names)
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# Dotplot visualization for gene markers expression per cluster
+#-------------------------------------------------------------------------------
+plt <- DotPlot(merged_mouse, # or merged_human
+               features = celltype_markers
+               ) + 
+                   #RotatedAxis() +
+                   scale_color_viridis(option = "plasma", direction = -1) +
+                   theme_classic() +   
+                   theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+                   labs(title = "Gene Marker Expression Across Clusters", x = "Markers", y = "Clusters")
+plt
+# Save
+ggsave(filename = file.path(mouse_path_figures, # or human_path_figures
+                            "all_samples", "dotplot.jpg"), plot = plt, width = 16, height = 8)
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# Function: Annotate Cell Types 
+#-------------------------------------------------------------------------------
+
+#' @title Annotate cell types based on module scores
+#'
+#' @description This function computes scores, for each cell, based on predefined gene sets (cell type markers, also called modules),
+#' assigns to each cluster the cell type (module) with the highest average score, and adds a "celltype" column to the metadata.
+#'
+#' @param seurat_object (Seurat)          : A Seurat object with clusters identified.
+#' @param celltype_markers (list of lists): A named list where each element is a list of marker genes
+#'                                          for a specific cell type.
+#' @return (Seurat)                       : The input Seurat object with updated metadata, including a
+#'                                          "celltype" column.
+#' @export
+annotate_celltypes <- function(seurat_object, celltype_markers) {
+  
+  # ----------------------------------------------------------------------------
+  # 1. Compute Module Scores 
+  # ----------------------------------------------------------------------------
+  # AddModuleScore calculates the average expression of predefined gene sets (modules) for each cell
+  # The result is additional metadata columns (i.e., modules named as the defined cell types) 
+  # with scores for each cell.
+  
+  seurat_object <- AddModuleScore(
+    object = seurat_object, 
+    features = celltype_markers,    # List of gene sets (marker genes for cell types)
+    name = names(celltype_markers)  # Prefix for new metadata columns
+  )
+  
+  #-----------------------------------------------------------------------------
+  # 2. Rename New Metadata Columns (Modules)
+  #-----------------------------------------------------------------------------
+  # Columns added by AddModuleScore are named as "<celltype_name><index>" (e.g., "neurons1").
+  # Remove the numeric suffix to restore the original cell type names.
+  
+  # Generate expected new column names
+  new_columns <- paste0(names(celltype_markers), seq_along(names(celltype_markers)))
+  
+  # Rename these columns to their original names
+  for (i in seq_along(new_columns)) {
+    old_name <- new_columns[i]
+    new_name <- names(celltype_markers)[i]
+    colnames(seurat_object@meta.data)[colnames(seurat_object@meta.data) == old_name] <- new_name
+  }
+  
+  #-----------------------------------------------------------------------------
+  # 3. Calculate The Average Score For Each Module (Cell Type) Per Cluster
+  #-----------------------------------------------------------------------------
+  # Identify all unique cluster IDs and cell types
+  cluster_ids <- unique(seurat_object@meta.data$seurat_clusters)
+  celltype_columns <- names(celltype_markers)
+  
+  # Compute the average expression score for each cell type per cluster
+  avg_scores_by_cluster <- sapply(cluster_ids, function(cluster_id) {
+    # Subset the metadata for cells in the current cluster
+    cluster_cells <- seurat_object@meta.data[seurat_object@meta.data$seurat_clusters == cluster_id, celltype_columns]
+    
+    # Calculate column-wise mean (average score per cluster for each cell type)
+    colMeans(cluster_cells)
+  })
+  
+  # Convert results into a data frame: rows = cell types, columns = clusters
+  avg_scores_by_cluster <- as.data.frame(avg_scores_by_cluster)
+  colnames(avg_scores_by_cluster) <- cluster_ids
+  
+  #-----------------------------------------------------------------------------
+  # 4. Assign Cell Types to Clusters
+  #-----------------------------------------------------------------------------
+  # For each cluster, identify the cell type with the highest average score
+  highest_scoring_celltypes <- apply(avg_scores_by_cluster, 2, function(scores) {
+    rownames(avg_scores_by_cluster)[which.max(scores)]
+  })
+  
+  #-----------------------------------------------------------------------------
+  # 5. Add Cell Type Annotations to Metadata
+  #-----------------------------------------------------------------------------
+  # Create a new column "celltype" in the metadata that assigns a cell type 
+  # to each cell based on its cluster
+  seurat_object@meta.data$celltype <- highest_scoring_celltypes[as.character(seurat_object@meta.data$seurat_clusters)]
+  
+  #-----------------------------------------------------------------------------
+  # 6. Clean Metadata
+  #-----------------------------------------------------------------------------
+  # Remove the intermediate module score columns from the metadata, leaving only the final "celltype" column
+  seurat_object@meta.data <- seurat_object@meta.data[, !colnames(seurat_object@meta.data) %in% celltype_columns]
+  
+  #-----------------------------------------------------------------------------
+  # Return the updated Seurat object
+  #-----------------------------------------------------------------------------
+  return(seurat_object)
+}
+
+#-------------------------------------------------------------------------------
+# Example Usage
+#-------------------------------------------------------------------------------
+merged_mouse <- annotate_celltypes(merged_mouse, celltype_markers = celltype_markers)
+#merged_human <- annotate_celltypes(merged_human, celltype_markers = celltype_markers)
+```
+
+
+```{r}
+# UMAP visualization 
+plt <- apply_theme(DimPlot(merged_mouse, # or merged_human
+                                   reduction = "umap.rpca", group.by = "celltype", label = TRUE), "Cell types")
+plt
+
+# Save
+ggsave(filename = file.path(mouse_path_figures, # or human_path_figures
+                       "all_samples",
+                       "cell_types.png"), plot = plt, width = 10, height = 8)
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# Function: Count Cells and Calculate Percentages
+#-------------------------------------------------------------------------------
+#'
+#' @description This function calculates the count and percentage of cells for each cell type
+#'              from the metadata of a Seurat object.
+#'
+#' @param seurat_object (Seurat) : A Seurat object with a "celltype" column in its metadata.
+#' @return (data.frame)          : A data frame with cell type counts and percentages.
+#' @export
+summarize_celltypes <- function(seurat_object) {
+  
+  # Create a table to count the number of cells in each cell type
+  celltype_counts <- table(seurat_object@meta.data$celltype)
+  
+  # Convert the table to a data frame for better visualization
+  celltype_summary <- as.data.frame(celltype_counts)
+  colnames(celltype_summary) <- c("CellType", "Count")
+  
+  # Calculate the percentage of each cell type 
+  total_cells <- sum(celltype_summary$Count)
+  celltype_summary$Percentage <- round((celltype_summary$Count / total_cells) * 100, 2)
+  
+  # Return the summarized data frame
+  return(celltype_summary)
+}
+
+#-------------------------------------------------------------------------------
+# Example Usage
+#-------------------------------------------------------------------------------
+#summarize_celltypes(merged_mouse)
+#summarize_celltypes(merged_human)
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# Save the annotated objects
+# ------------------------------------------------------------------------------
+saveRDS(merged_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_annotated.rds"))
+#saveRDS(merged_human, file = file.path(human_save_path, "all_samples", "human_annotated.rds"))
+```
+
+# 5. Mouse V1 classification using CITE-seq samples as reference (positive selection)
+```{r}
+# Load the RDS files
+merged_mouse <- readRDS(file.path(mouse_save_path, "all_samples", "mouse_annotated.rds"))
+# merged_human <- readRDS(file.path(human_save_path, "all_samples", "human_annotated.rds"))
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# Define the general paths to save and load the data
+#-------------------------------------------------------------------------------
+mouse_save_path <- file.path(getwd(), "..", "Rdata", "mouse", "neurons")
+human_save_path <- file.path(getwd(), "..", "Rdata", "human", "neurons")
+
+#-------------------------------------------------------------------------------
+# Define the general paths to save the figures
+#-------------------------------------------------------------------------------
+mouse_path_figures <- file.path(getwd(), "..", "figures", "mouse", "neurons")
+human_path_figures <- file.path(getwd(), "..", "figures", "human", "neurons")
+```
+
+## 5.1 Neurons
+```{r}
+# Set identity to cell type
+Idents(merged_mouse) <- "celltype"
+# Idents(merged_human) <- "celltype"
+
+# Create a subset of neurons only 
+neurons_mouse <- subset(merged_mouse, idents = "neurons")
+# neurons_human <- subset(merged_human, idents = "neurons")
+```
+
+```{r}
+# Re-run workflow on neurons subset 
+neurons_mouse <- process_merged_object(neurons_mouse)
+neurons_mouse <- perform_integration(neurons_mouse)
+neurons_mouse <- FindNeighbors(neurons_mouse, reduction = "umap.rpca", dims = 1:2, force.recalc = T)
+neurons_mouse <- FindClusters(neurons_mouse, resolution = 1.5)
+
+# neurons_human <- process_merged_object(neurons_human)
+# neurons_human <- perform_integration(neurons_human)
+```
+
+```{r}
+# UMAP visualization
+plt <- apply_theme(DimPlot_scCustom(neurons_mouse,
+                                     reduction = "umap.rpca", group.by = "seurat_clusters", label = TRUE), "Neurons clusters - Post-integration (RPCA)")
+plt
+
+# Save
+ggsave(filename = file.path(mouse_path_figures, "all_samples", "clusters.png"), plot = plt, width = 10, height = 8)
+```
+
+
+```{r}
+# UMAP visualization
+# Group by samples
+p1 <- apply_theme(DimPlot(neurons_mouse, # or neurons_human
+                                   reduction = "umap.rpca", group.by = "orig.ident"), "Neurons distribution per sample - Post-integration (RPCA)")
+p1
+# Split by samples
+p2 <- apply_theme(DimPlot(neurons_mouse, # or neurons_human
+                                   reduction = "umap.rpca", group.by = "orig.ident", split.by = "orig.ident"), "Neurons distribution per sample - Post-integration (RPCA)")
+p2
+
+# Save
+ggsave(filename = file.path(mouse_path_figures, # or human_path_figures
+                       "all_samples",
+                       "neurons_distribution_grouped_postintegration.png"), plot = p1, width = 10, height = 8)
+ggsave(filename = file.path(mouse_path_figures, # or human_path_figures
+                       "all_samples",
+                       "neurons_distribution_splited_postintegration.png"), plot = p2, width = 20, height = 10)
+```
+
+
+```{r}
+# UMAP visualization
+plt <- apply_theme(FeaturePlot_scCustom(neurons_mouse, features = "GFP-TotalSeqC", reduction = "umap.rpca"), "GFP-TotalSeqC expression across neurons - Post-integration (RPCA)")
+plt
+
+ggsave(filename = file.path(mouse_path_figures, "all_samples", "GFP_expression_postintegration.png"), plot = plt, width = 10, height = 8)
+```
+
+```{r}
+# Count the number of neurons per sample
+table(neurons_mouse@meta.data$orig.ident, neurons_mouse@meta.data$celltype)
+# table(neurons_human@meta.data$orig.ident, neurons_human@meta.data$celltype)
+```
+
+```{r}
+# Save 
+saveRDS(neurons_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_neurons.rds"))
+# saveRDS(neurons_human, file = file.path(human_save_path, "all_samples", "human_neurons.rds"))
+```
+
+## 5.2 V1
+### 5.2.1 Mouse V1 neurons
+```{r}
+# Identify GFP+ neurons 
+GFP_positive_neurons <- neurons_mouse@meta.data$GFP > 0  
+
+# Calculate total neurons per cluster
+clusters <- neurons_mouse@meta.data$seurat_clusters 
+total_neurons_per_cluster <- table(clusters)
+
+# Calculate GFP+ neurons per cluster
+GFP_positive_counts <- table(clusters[GFP_positive_neurons])
+
+# Calculate percentage of GFP+ neurons per cluster
+GFP_positive_percentages <- round((GFP_positive_counts / total_neurons_per_cluster[names(GFP_positive_counts)]) * 100, 2)
+
+# Identify and keep only clusters with a GFP+ percentage > 5%
+selected_clusters <- names(GFP_positive_percentages[GFP_positive_percentages > 5]) # Clusters to recode
+
+# Update the "celltype" column for neurons in the selected clusters
+neurons_mouse@meta.data$celltype[neurons_mouse@meta.data$seurat_clusters %in% selected_clusters] <- "V1"
+```
+
+
+```{r}
+# UMAP visualization 
+plt <- apply_theme(DimPlot(neurons_mouse, reduction = "umap.rpca", group.by = "celltype", label = TRUE), "Cell types")
+plt
+
+# Save
+ggsave(filename = file.path(mouse_path_figures, "all_samples", "cell_types.png"), plot = plt, width = 10, height = 8)
+```
+
+```{r}
+# Count cells and calculate percentages
+summarize_celltypes(neurons_mouse)
+```
+
+```{r}
+# Count the number of each cell type per sample
+table(neurons_mouse@meta.data$orig.ident, neurons_mouse@meta.data$celltype)
+```
+
+```{r}
+# Save 
+saveRDS(neurons_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_neurons_annotated.rds"))
+```
+
+### 5.2.2 Human V1 neurons
+```{r}
+# Load the RDS files
+neurons_mouse <- readRDS(file.path(mouse_save_path, "all_samples", "mouse_neurons.rds"))
+neurons_human <- readRDS(file.path(human_save_path, "all_samples", "human_neurons.rds"))
+```
+
+#### 5.2.2.1 Find mouse orthologs for human genes using Biomart
+```{r}
+#-------------------------------------------------------------------------------
+# Define the general paths to save and load the data
+#-------------------------------------------------------------------------------
+cross_species_save_path <- file.path(getwd(), "..", "Rdata", "cross_species", "neurons")
+
+#-------------------------------------------------------------------------------
+# Define the general paths to save the figures
+#-------------------------------------------------------------------------------
+cross_species_path_figures <- file.path(getwd(), "..", "figures", "cross_species", "neurons")
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# 1. Access Human Genes Dataset Using BioMart
+#-------------------------------------------------------------------------------
+# Connect to the Ensembl BioMart database and select the human genes dataset
+human <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Define attributes to retrieve from the dataset:
+# - Human Ensembl ID and official gene symbol.
+# - Mouse ortholog Ensembl ID and official gene symbol.
+# - Orthology type (e.g., one-to-one or many-to-many).
+# - Percentage of identity between human and mouse gene sequences.
+attributes <- c(
+  "ensembl_gene_id",               # Human Ensembl ID
+  "external_gene_name",            # Human official gene symbol/name
+  "mmusculus_homolog_ensembl_gene", # Mouse Ensembl ID
+  "mmusculus_homolog_associated_gene_name", # Mouse official gene symbol/name
+  "mmusculus_homolog_orthology_type",       # Orthology type
+  "mmusculus_homolog_perc_id_r1"            # % of identity (human vs mouse sequences)
+)
+
+#-------------------------------------------------------------------------------
+# 2. Retrieve Mouse Homologs for Human Genes
+#-------------------------------------------------------------------------------
+# Query BioMart to retrieve genes from the human dataset that have mouse homologs
+# The "with_mmusculus_homolog" filter ensures only genes with mouse homologs are retrieved
+# The result includes multiple types of orthologs (e.g., one-to-one, one-to-many)
+orth.mouse <- getBM(
+  attributes = attributes,
+  filters = "with_mmusculus_homolog",
+  values = TRUE,        # Include all genes with mouse homologs 
+  mart = human,
+  uniqueRows = TRUE     # Remove duplicate rows
+)
+
+#-------------------------------------------------------------------------------
+# 3. Filter for One-to-One Orthologs
+#-------------------------------------------------------------------------------
+# - Keep only rows where the orthology type is "ortholog_one2one"
+# - Remove the "mmusculus_homolog_perc_id_r1" column (identity percentage) and
+#   "mmusculus_homolog_orthology_type" column (orthology type) to simplify the output
+# - Exclude rows where the human gene name is empty.
+
+orth.mouse.filtered <- orth.mouse %>%
+  filter(mmusculus_homolog_orthology_type == "ortholog_one2one") %>%  # Filter one-to-one orthologs
+  dplyr::select(-mmusculus_homolog_perc_id_r1, -mmusculus_homolog_orthology_type) %>%  # Drop unwanted columns
+  filter(external_gene_name != "")  # Exclude rows with empty human gene names
+
+#-------------------------------------------------------------------------------
+# Save the filtered one-to-one orthologs to a CSV file
+#-------------------------------------------------------------------------------
+# write.csv(orth.mouse.filtered, "one2one_orthologs.csv", row.names = FALSE)
+```
+
+#### 5.2.2.2 Cross-species integration
+```{r}
+#-------------------------------------------------------------------------------
+# 1. Load human-mouse ortholog genes
+#-------------------------------------------------------------------------------
+# Load the CSV file containing one-to-one human-mouse orthologs
+human_mouse_orthologs <- read.csv('one2one_orthologs.csv')  # 17,068 orthologs
+# Columns in the CSV:
+# - `ensembl_gene_id`: Human Ensembl gene ID
+# - `external_gene_name`: Human gene symbol
+# - `mmusculus_homolog_ensembl_gene`: Mouse Ensembl gene ID
+# - `mmusculus_homolog_associated_gene_name`: Mouse gene symbol
+
+#-------------------------------------------------------------------------------
+# 2. Extract mouse neurons gene count matrix
+#-------------------------------------------------------------------------------
+# Retrieve the raw counts matrix of mouse neurons
+neurons_mouse_counts <- GetAssayData(neurons_mouse, layer = "counts")
+
+# Check dimensions of the count matrix
+dim(neurons_mouse_counts)  # 20,749 genes, 18,102 neurons
+
+#-------------------------------------------------------------------------------
+# 3. Filter count matrix for mouse genes with human orthologs
+#-------------------------------------------------------------------------------
+# Retain only rows (genes) in the count matrix that have a human ortholog
+# Use the `mmusculus_homolog_associated_gene_name` column in the ortholog mapping
+neurons_mouse_counts <- neurons_mouse_counts[
+  rownames(neurons_mouse_counts) %in% human_mouse_orthologs$mmusculus_homolog_associated_gene_name, 
+]
+
+# Check dimensions after filtering
+dim(neurons_mouse_counts)  # 13,874 genes, 18,102 neurons
+
+#-------------------------------------------------------------------------------
+# 4. Rename mouse genes to their human orthologs (uppercase gene names)
+#-------------------------------------------------------------------------------
+# Match the row names (gene names) in the count matrix with the
+# `mmusculus_homolog_associated_gene_name` column in the ortholog mapping.
+
+matched.genes <- match(
+  rownames(neurons_mouse_counts),  # Mouse genes in the count matrix
+  human_mouse_orthologs$mmusculus_homolog_associated_gene_name  # Mouse genes in the ortholog mapping
+)
+
+# Extract the corresponding human gene names (external_gene_name)
+replaced_gene_names <- human_mouse_orthologs[matched.genes, "external_gene_name"]
+
+# Replace the row names of the count matrix with the human gene names
+rownames(neurons_mouse_counts) <- replaced_gene_names
+
+# Check the updated row names in the count matrix to confirm that mouse gene names
+# have been replaced by their human ortholog names
+head(rownames(neurons_mouse_counts))
+
+# Check dimensions to ensure no changes in the number of rows or columns
+dim(neurons_mouse_counts)  # 13,874 genes, 18,102 neurons
+
+#-------------------------------------------------------------------------------
+# 5. Extract human neurons gene count matrix
+#------------------------------------------------------------------------------- 
+# Retrieve the raw counts matrix of human neurons
+neurons_human_counts <- GetAssayData(neurons_human, layer = "counts")
+dim(neurons_human_counts) # 27,443 genes, 18,927 neurons
+
+#-------------------------------------------------------------------------------
+# 6. Identify common genes between mouse and human count matrices
+#-------------------------------------------------------------------------------
+# Find the intersection of genes between mouse and human matrices
+common_genes <- intersect(rownames(neurons_mouse_counts), rownames(neurons_human_counts))
+
+# Filter both count matrices to include only common genes
+neurons_mouse_counts <- neurons_mouse_counts[common_genes, ]
+neurons_human_counts <- neurons_human_counts[common_genes, ]
+
+# Check dimensions after filtering
+dim(neurons_mouse_counts) # 13,546 genes, 18,102 neurons
+dim(neurons_human_counts) # 13,546 genes, 18,927 neurons
+
+#-------------------------------------------------------------------------------
+# 7. Create a merged mouse-human object 
+#-------------------------------------------------------------------------------
+# 7.1 Create an object for filtered mouse neurons
+neurons_mouse_filtered <- CreateSeuratObject(counts = neurons_mouse_counts)
+neurons_mouse_filtered$species <- "mouse"
+
+# 7.2 Add Antibody assay to the filtered mouse neurons object
+GFP_norm_counts <- GetAssayData(neurons_mouse, assay = "Antibody", layer = "data")
+antibody_assay <- CreateAssayObject(counts = GFP_norm_counts)
+neurons_mouse_filtered[["Antibody"]] <- antibody_assay
+# Add new column to metadata with GFP-TotalSeqC expression
+gfp_expression_norm <- FetchData(neurons_mouse_filtered, vars = "GFP-TotalSeqC", layer = "data")
+neurons_mouse_filtered <- AddMetaData(neurons_mouse_filtered, metadata = gfp_expression_norm, col.name = "GFP")
+
+# 7.3 Create an object for filtered human neurons 
+neurons_human_filtered <- CreateSeuratObject(counts = neurons_human_counts)
+neurons_human_filtered$species <- "human"
+
+# 7.4 Merge
+merged_mouse_human <- merge(neurons_mouse_filtered, neurons_human_filtered)
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# 8. Run workflow on mouse human merged object
+#-------------------------------------------------------------------------------
+# 8.1 Processing 
+merged_mouse_human <- process_merged_object(merged_mouse_human)
+
+# UMAP visualization (Pre-integration)
+# Group by samples
+p1 <- apply_theme(DimPlot(merged_mouse_human, reduction = "umap", group.by = "orig.ident"), "Neurons distribution per sample - Pre-integration")
+p1
+
+# Group by species
+p2 <- apply_theme(DimPlot(merged_mouse_human, reduction = "umap", group.by = "species"), "Neurons distribution per species - Pre-integration")
+p2
+
+# Split by samples
+p3 <- apply_theme(DimPlot(merged_mouse_human, reduction = "umap", split.by = "orig.ident"), "Neurons distribution per sample - Pre-integration")
+p3
+
+# Split by species
+p4 <- apply_theme(DimPlot(merged_mouse_human, reduction = "umap", split.by = "species"), "Neurons distribution per species - Pre-integration")
+p4
+
+# Save
+ggsave(filename = file.path(cross_species_path_figures,
+                       "samples_distribution_grouped_preintegration.png"), plot = p1, width = 10, height = 8)
+ggsave(filename = file.path(cross_species_path_figures,
+                       "species_distribution_grouped_preintegration.png"), plot = p2, width = 10, height = 8)
+ggsave(filename = file.path(cross_species_path_figures,
+                       "samples_distribution_splited_preintegration.png"), plot = p3, width = 20, height = 10)
+ggsave(filename = file.path(cross_species_path_figures,
+                       "species_distribution_splited_preintegration.png"), plot = p4, width = 20, height = 10)
+```
+
+
+```{r}
+# 8.2 Update metadata 
+# Update "orig.ident" column for samples "KNAF3" and "KNAF4"
+merged_mouse_human@meta.data$orig.ident[merged_mouse_human@meta.data$orig.ident %in% c("KNAF3", "KNAF4")] <- "KNAF3-4"
+```
+
+```{r}
+# 8.3 Cross-species integration
+merged_mouse_human <- perform_integration(merged_mouse_human)
+
+# UMAP visualization (Post-integration)
+# Group by samples
+p1 <- apply_theme(DimPlot(merged_mouse_human, reduction = "umap.rpca", group.by = "orig.ident"), "Neurons distribution per sample - Post-integration")
+p1
+
+# Group by species
+p2 <- apply_theme(DimPlot(merged_mouse_human, reduction = "umap.rpca", group.by = "species"), "Neurons distribution per species - Post-integration")
+p2
+
+# Split by samples
+p3 <- apply_theme(DimPlot(merged_mouse_human, reduction = "umap.rpca", split.by = "orig.ident"), "Neurons distribution per sample - Post-integration")
+p3
+
+# Split by species
+p4 <- apply_theme(DimPlot(merged_mouse_human, reduction = "umap.rpca", split.by = "species"), "Neurons distribution per species - Post-integration")
+p4
+
+# Save
+ggsave(filename = file.path(cross_species_path_figures,
+                       "samples_distribution_grouped_postintegration.png"), plot = p1, width = 10, height = 8)
+ggsave(filename = file.path(cross_species_path_figures,
+                       "species_distribution_grouped_postintegration.png"), plot = p2, width = 10, height = 8)
+ggsave(filename = file.path(cross_species_path_figures,
+                       "samples_distribution_splited_postintegration.png"), plot = p3, width = 20, height = 10)
+ggsave(filename = file.path(cross_species_path_figures,
+                       "species_distribution_splited_postintegration.png"), plot = p4, width = 20, height = 10)
+```
+
+
+```{r}
+# UMAP visualization
+plt <- apply_theme(FeaturePlot_scCustom(merged_mouse_human, features = "GFP-TotalSeqC", reduction = "umap.rpca"), "GFP-TotalSeqC expression across neurons - Post-integration (RPCA)")
+plt
+
+ggsave(filename = file.path(cross_species_path_figures, "GFP_expression_postintegration.png"), plot = plt, width = 10, height = 8)
+```
+
+
+```{r}
+# 8.4 Clustering
+merged_mouse_human <- FindNeighbors(merged_mouse_human, reduction = "umap.rpca", dims = 1:2, force.recalc = T)
+merged_mouse_human <- FindClusters(merged_mouse_human, resolution = 1)
+```
+
+```{r}
+# UMAP visualization
+plt <- apply_theme(DimPlot_scCustom(merged_mouse_human, reduction = "umap.rpca", group.by = "seurat_clusters", label = TRUE), "Neurons clusters - Post-integration (RPCA)")
+plt
+
+# Save
+ggsave(filename = file.path(cross_species_path_figures, "clusters.png"), plot = plt, width = 10, height = 8)
+```
+
+
+```{r}
+# 8.5 Identify clusters with GFP+ neurons (clusters annotation)
+# Identify GFP+ neurons 
+GFP_positive_neurons <- merged_mouse_human@meta.data$GFP > 0  
+
+# Calculate total neurons per cluster
+clusters <- merged_mouse_human@meta.data$seurat_clusters 
+total_neurons_per_cluster <- table(clusters)
+
+# Calculate GFP+ neurons per cluster
+GFP_positive_counts <- table(clusters[GFP_positive_neurons])
+
+# Calculate percentage of GFP+ neurons per cluster
+GFP_positive_percentages <- round((GFP_positive_counts / total_neurons_per_cluster[names(GFP_positive_counts)]) * 100, 2)
+
+# Identify and keep only clusters with a GFP+ percentage > 5%
+selected_clusters <- names(GFP_positive_percentages[GFP_positive_percentages > 5]) # Clusters to recode
+
+# Update the "celltype" column for neurons in the selected clusters
+merged_mouse_human@meta.data$celltype <- "neurons"
+merged_mouse_human@meta.data$celltype[merged_mouse_human@meta.data$seurat_clusters %in% selected_clusters] <- "V1"
+```
+
+```{r}
+# UMAP visualization 
+p1 <- apply_theme(DimPlot(merged_mouse_human, reduction = "umap.rpca", group.by = "celltype", label = TRUE), "Cell types")
+p1
+
+p2 <- apply_theme(DimPlot(merged_mouse_human, reduction = "umap.rpca", group.by = "celltype", split.by = "species", label = TRUE), "Cell types")
+p2
+
+# Save
+ggsave(filename = file.path(cross_species_path_figures, "cell_types.png"), plot = p1, width = 10, height = 8)
+
+ggsave(filename = file.path(cross_species_path_figures, "cell_types_split.png"), plot = p2, width = 10, height = 8)
+```
+
+```{r}
+# 8.6 Counts
+# Count the number of each cell type per sample
+table(merged_mouse_human@meta.data$orig.ident, merged_mouse_human@meta.data$celltype)
+
+# Count the number of each cell type per species
+table(merged_mouse_human@meta.data$species, merged_mouse_human@meta.data$celltype)
+```
+
+```{r}
+# Save 
+saveRDS(merged_mouse_human, file = file.path(cross_species_save_path, "cross_species_neurons_v1_annotated.rds"))
+```
+
+
+```{r}
+#-------------------------------------------------------------------------------
+# Define the general paths to save the data
+#-------------------------------------------------------------------------------
+human_save_path <- file.path(getwd(), "..", "Rdata", "human", "V1")
+```
+
+```{r}
+# Subset human V1
+# v1_human <- subset(merged_mouse_human, 
+```
+
+```{r}
+# Save 
+# saveRDS(v1_human, file = file.path(human_save_path, "all_samples", "v1_human.rds"))
+```
+
+
+
+
+
