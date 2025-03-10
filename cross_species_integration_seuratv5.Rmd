@@ -56,8 +56,8 @@ options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB fo
 
 
 ```{r}
-mouse_neurons <- readRDS("data/mouse_neurons.rds")
-human_neurons <- readRDS("data/human_neurons.rds")
+mouse_neurons <- readRDS("data/origin_data/mouse_neurons.rds")
+human_neurons <- readRDS("data/origin_data/human_neurons.rds")
 ```
 
 ```{r}	
@@ -199,7 +199,7 @@ cross_species <- merge(mouse_neurons, human_neurons)
 ```
 
 ```{r}	
-cross_species <- subset(x = cross_species, subset = orig.ident %in% c("KNAF11", "KNAF10", "KNAF9", "KNAF8", "KNAF3", "KNAF4"))
+cross_species <- subset(x = cross_species, subset = orig.ident %in% c("YADAV", "ZHANG", "KNAF11", "KNAF10", "KNAF9", "KNAF8", "KNAF3", "KNAF4"))
 ```
 
 ```{r}
@@ -230,7 +230,7 @@ cross_species <- RunUMAP(cross_species, reduction = 'rpca', dims = 1:30, reducti
 ```
 
 ```{r}  
-DimPlot(cross_species, reduction = 'umap.rpca',group.by = "orig.ident", title = 'Cross-species rpca integration UMAP')
+DimPlot(cross_species, reduction = 'umap.rpca', group.by = "orig.ident")
 ```
 
 ```{r}	
@@ -257,10 +257,10 @@ cross_species$training_labels[cross_species$orig.ident == "KNAF3"] <- 0
 
 ```{r}
 # Save the integrated dataset as h5
-SaveH5Seurat(cross_species, filename = "cross_species_rpca_v5_knafonly.h5Seurat", overwrite = TRUE)
+SaveH5Seurat(cross_species, filename = "data/co_integrated_data/cross_species_human_augmented.h5Seurat", overwrite = TRUE)
 
 ```	
 
 ```{r}
-Convert(source = "cross_species_rpca_v5_knafonly.h5Seurat", dest = "cross_species_rpca_v5_knafonly.h5ad", overwrite = TRUE)
+Convert(source = "data/co_integrated_data/cross_species_human_augmented.h5Seurat", dest = "data/co_integrated_data/cross_species_human_augmented.h5ad", overwrite = TRUE)
 ```	

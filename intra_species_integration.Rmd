@@ -55,23 +55,35 @@ options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB fo
 ```
 
 ```{r}
-mouse_neurons <- readRDS("data/mouse_neurons.rds")
+mouse_neurons <- readRDS("data/origin_data/mouse_neurons.rds")
+mouse_neurons_skinnider <- readRDS("data/origin_data/mouse_neurons_skinnider.rds")
 ```
 
 ```{r}	
 neurons_mouse_counts <- GetAssayData(mouse_neurons, layer = "counts")
+neurons_mouse_skinnider_counts <- GetAssayData(mouse_neurons_skinnider, layer = "counts")
 ```
+
 
 ```{r}
 # Merge mouse and human datasets
 mouse_neurons = CreateSeuratObject(counts = neurons_mouse_counts)
 mouse_neurons$species <- "mouse"
+mouse_neurons_skinnider <- CreateSeuratObject(counts = neurons_mouse_skinnider_counts)
+mouse_neurons_skinnider$species <- "mouse"
 ```
 
 ```{r}	
 # Drop all layers from other papers
 mouse_neurons <- subset(x = mouse_neurons, subset = orig.ident %in% c("MATSON", "KATHE", "KNAF3", "KNAF4", "BOUV5"))
 # mouse_neurons <- subset(x = mouse_neurons, subset = orig.ident %in% c("KNAF11", "KNAF10", "KNAF9", "KNAF8", "BOUV6", "BOUV7"))
+```
+```{r}
+merged_neurons <- merge(mouse_neurons, mouse_neurons_skinnider)
+```
+
+```{r}
+mouse_neurons <- merged_neurons
 ```
 
 ```{r}
@@ -142,12 +154,12 @@ DimPlot(mouse_neurons, reduction = 'umap.rpca',group.by = "citeseq")
 
 ```{r}
 # Save the integrated dataset as h5
-SaveH5Seurat(mouse_neurons, filename = "mouse_neurons_counts_knafbouv+lit_ref.h5Seurat", overwrite = TRUE)
+SaveH5Seurat(mouse_neurons, filename = "mouse_neurons+skinnider.h5Seurat", overwrite = TRUE)
 
 ```	
 
 ```{r}
-Convert(source = "mouse_neurons_counts_knafbouv+lit_ref.h5Seurat", dest = "mouse_neurons_counts_knafbouv+lit_ref.h5ad", overwrite = TRUE)
+Convert(source = "mouse_neurons+skinnider.h5Seurat", dest = "mouse_neurons+skinnider.h5ad", overwrite = TRUE)
 ```	
 
 ```{r}
