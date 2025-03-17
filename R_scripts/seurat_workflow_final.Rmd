@@ -52,9 +52,6 @@ pak::pkg_install(c(
   "roxygen2"                           # Documentation
 ))
 
-```
-
-```{r}
 # Load necessary libraries
 library(Seurat)               
 library(scCustomize)          
@@ -64,7 +61,6 @@ library(biomaRt)
 library(dplyr)
 library(knitr)
 library(roxygen2)
-library(ggplot2)
 
 # Set seed for reproducibility
 set.seed(1234)
@@ -102,6 +98,9 @@ if (!"DoubletFinder" %in% installed.packages()) {
   remotes::install_github("chris-mcginnis-ucsf/DoubletFinder")
 }
 library(DoubletFinder)
+library(ggplot2)
+library(patchwork)
+library(viridis)
 
 # Set seed for reproducibility
 set.seed(1234)
@@ -115,13 +114,13 @@ options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB fo
 #-------------------------------------------------------------------------------
 # Define the general paths to save the pre-processed samples
 #-------------------------------------------------------------------------------
-mouse_save_path <- file.path(getwd(), "Rdata", "mouse", "all_cells", "all_samples")
-human_save_path <- file.path(getwd(), "Rdata", "human", "all_cells", "all_samples")
+mouse_save_path <- file.path(getwd(), "..", "Rdata", "mouse", "all_cells", "all_samples")
+human_save_path <- file.path(getwd(), "..", "Rdata", "human", "all_cells", "all_samples")
 #-------------------------------------------------------------------------------
 # Define the general paths to save the figures
 #-------------------------------------------------------------------------------
-mouse_path_figures <- file.path(getwd(),"figures", "mouse", "all_cells", "all_samples")
-human_path_figures <- file.path(getwd(), "figures", "human", "all_cells", "all_samples")
+mouse_path_figures <- file.path(getwd(), "..", "figures", "mouse", "all_cells", "all_samples")
+human_path_figures <- file.path(getwd(), "..", "figures", "human", "all_cells", "all_samples")
 ```
 
 ## 1.1 Load 10X snRNA-seq data and calculate the corrected count matrices with SoupX – Using CellRanger clusters
@@ -295,7 +294,7 @@ correct_counts_soupx_seurat <- function(species = "mouse", author = NULL) {
       DefaultAssay(seurat_filtered)
       seurat_filtered <- RunPCA(seurat_filtered)  # Uses scaled data (scale.data) is in the active assay (SCT here)
       seurat_filtered <- RunUMAP(seurat_filtered, reduction = "pca", dims = 1:30)
-      #Instead of applying FindNeighbors (which builds the SNN graph) 
+      # Instead of applying FindNeighbors (which builds the SNN graph) 
       # and FindClusters (which runs community detection on that graph) on the PCA space,
       # we will apply them on the UMAP space (To avoid clusters mixed with cells from other clusters)
       seurat_filtered <- FindNeighbors(seurat_filtered, reduction = "umap", dims = 1:2, force.recalc = T)
@@ -337,8 +336,8 @@ correct_counts_soupx_seurat <- function(species = "mouse", author = NULL) {
 # ------------------------------------------------------------------------------
 # Example usage
 # ------------------------------------------------------------------------------
-# mouse_list <- correct_counts_soupx_seurat(species = "mouse")
-human_list <- correct_counts_soupx_seurat(species = "human")
+mouse_list <- correct_counts_soupx_seurat(species = "mouse", author = "Skinnider")
+# human_list <- correct_counts_soupx_seurat(species = "human", author = "Knafo")
 # knafo_list <- correct_counts_soupx_seurat(species = "mouse", author = "Knafo")
 ```
 
@@ -468,20 +467,20 @@ mouse_list <- mouse_list[order(names(mouse_list))]
 # ------------------------------------------------------------------------------
 # Save the corrected objects
 # ------------------------------------------------------------------------------
-# saveRDS(mouse_list, file = file.path(mouse_save_path, "mouse_soupx.rds"))
-saveRDS(human_list, file = file.path(human_save_path, "human_soupx.rds"))
+saveRDS(mouse_list, file = file.path(mouse_save_path, "skinnider_soupx.rds"))
+# saveRDS(human_list, file = file.path(human_save_path, "human_soupx.rds"))
 ```
 
 ## 1.3 Filtering of potential doublets with DoubletFinder
 ```{r}
 # Load the RDS files
-# mouse_list <- readRDS(file.path(mouse_save_path, "mouse_soupx.rds"))
-human_list <- readRDS(file.path(human_save_path, "human_soupx.rds"))
+mouse_list <- readRDS(file.path(mouse_save_path, "skinnider_soupx.rds"))
+# human_list <- readRDS(file.path(human_save_path, "human_soupx.rds"))
 ```
 
 ```{r}
 # Count the number of cells in each Seurat object within seurat_list
-cell_counts <- sapply(human_list,  # mouse_list or human_list 
+cell_counts <- sapply(mouse_list,  # mouse_list or human_list 
                       function(seurat_obj) {
                         ncol(seurat_obj)
                         }
@@ -499,6 +498,60 @@ base_rate <- 0.008  # 0.8%
 multiplet_rates <- base_rate * (cell_counts / 1000)
 # Print the results
 print(multiplet_rates)
+```
+```{r}
+# Rewriting the paramSweep functoin to be able to modify the range of sweeps
+paramSweep <- function (seu, PCs = 1:10, sct = FALSE, num.cores = 1, pN = seq(0.05, 0.3, by = 0.05), pK = c(5e-04, 0.001, 0.005, seq(0.01, 0.3, by = 0.01))) 
+{
+    require(Seurat)
+    require(fields)
+    require(parallel)
+    pK <- pK[which(pK > 0)]
+    pN <- pN[which(pN > 0)]
+    min.cells <- round(nrow(seu@meta.data)/(1 - 0.05) - nrow(seu@meta.data))
+    pK.test <- round(pK * min.cells)
+    pK <- pK[which(pK.test >= 1)]
+    orig.commands <- seu@commands
+    if (nrow(seu@meta.data) > 10000) {
+        real.cells <- rownames(seu@meta.data)[sample(1:nrow(seu@meta.data), 
+            10000, replace = FALSE)]
+        data <- seu@assays$RNA$counts[, real.cells]
+        n.real.cells <- ncol(data)
+    }
+    if (nrow(seu@meta.data) <= 10000) {
+        real.cells <- rownames(seu@meta.data)
+        data <- seu@assays$RNA$counts
+        n.real.cells <- ncol(data)
+    }
+    if (num.cores > 1) {
+        require(parallel)
+        cl <- makeCluster(num.cores)
+        output2 <- mclapply(as.list(1:length(pN)), FUN = parallel_paramSweep, 
+            n.real.cells, real.cells, pK, pN, data, orig.commands, 
+            PCs, sct, mc.cores = num.cores)
+        stopCluster(cl)
+    }
+    else {
+        output2 <- lapply(as.list(1:length(pN)), FUN = parallel_paramSweep, 
+            n.real.cells, real.cells, pK, pN, data, orig.commands, 
+            PCs, sct)
+    }
+    sweep.res.list <- list()
+    list.ind <- 0
+    for (i in 1:length(output2)) {
+        for (j in 1:length(output2[[i]])) {
+            list.ind <- list.ind + 1
+            sweep.res.list[[list.ind]] <- output2[[i]][[j]]
+        }
+    }
+    name.vec <- NULL
+    for (j in 1:length(pN)) {
+        name.vec <- c(name.vec, paste("pN", pN[j], "pK", pK, 
+            sep = "_"))
+    }
+    names(sweep.res.list) <- name.vec
+    return(sweep.res.list)
+}
 ```
 
 ```{r}
@@ -543,7 +596,7 @@ detect_doublets <- function(seurat_list, base_rate = 0.008) {
     # ------------------------------------------------------------------------
     # 2. Identify the optimal pK 
     # ------------------------------------------------------------------------
-    sweep_list  <- paramSweep(seurat_obj, PCs = 1:30, sct = TRUE)
+    sweep_list  <- paramSweep(seurat_obj, PCs = 1:30, sct = TRUE, pN = seq(0.25, 0.3, by = 0.05))  #!!# Changed pN range
     sweep_stats <- summarizeSweep(sweep_list)
     bcmvn       <- find.pK(sweep_stats)
 
@@ -598,15 +651,16 @@ detect_doublets <- function(seurat_list, base_rate = 0.008) {
 # ------------------------------------------------------------------------------
 # Example usage 
 # ------------------------------------------------------------------------------
-# mouse_doublets <- detect_doublets(seurat_list = mouse_list, base_rate = 0.008)
+mouse_doublets <- detect_doublets(seurat_list = mouse_list, base_rate = 0.008)
 # human_doublets <- detect_doublets(seurat_list = human_list, base_rate = 0.008)
 ```
+
 
 ```{r}
 # ------------------------------------------------------------------------------
 # Save the doublet annotated objects
 # ------------------------------------------------------------------------------
-# saveRDS(mouse_doublets, file = file.path(mouse_save_path, "mouse_doublets.rds"))
+saveRDS(mouse_doublets, file = file.path(mouse_save_path, "mouse_doublets_skinnider.rds"))
 #saveRDS(human_doublets, file = file.path(human_save_path, "human_doublets.rds"))
 ```
 
@@ -614,7 +668,7 @@ detect_doublets <- function(seurat_list, base_rate = 0.008) {
 ## 1.4 Merge all Seurat objects (i.e., samples) into a single Seurat object
 ```{r}
 # Load the RDS files
-mouse_doublets <- readRDS(file.path(mouse_save_path, "mouse_doublets.rds"))
+# mouse_doublets <- readRDS(file.path(mouse_save_path, "mouse_doublets.rds"))
 # human_doublets <- readRDS(file.path(human_save_path, "human_doublets.rds"))
 ```
 
@@ -656,7 +710,7 @@ prepare_seurat_for_merge <- function(seurat_obj) {
 # ------------------------------------------------------------------------------
 # Example usage 
 # ------------------------------------------------------------------------------
-# mouse_doublets <- lapply(mouse_doublets, prepare_seurat_for_merge)
+mouse_doublets <- lapply(mouse_doublets, prepare_seurat_for_merge)
 # human_doublets <- lapply(human_doublets, prepare_seurat_for_merge)
 ```
 
@@ -679,14 +733,14 @@ merge_all_samples <- function(species_list) {
 # ----------------------------------------------------------------------------
 # Example usage 
 # ----------------------------------------------------------------------------
-# merged_mouse <- merge_all_samples(species_list = mouse_doublets)
+merged_mouse <- merge_all_samples(species_list = mouse_doublets)
 # merged_human <- merge_all_samples(species_list = human_doublets)
 ```
 
 ```{r}
 # Create a table summarizing singlets and doublets per sample
+# table(merged_mouse@meta.data$orig.ident, merged_mouse@meta.data$doublet_finder)
 table(merged_mouse@meta.data$orig.ident, merged_mouse@meta.data$doublet_finder)
-# table(merged_human@meta.data$orig.ident, merged_human@meta.data$doublet_finder)
 ```
 
 ## 1.5 Filtering of cells and genes based on quality control (QC) metrics
@@ -841,7 +895,7 @@ filter_cells <- function(merged_obj) {
 # ------------------------------------------------------------------------------
 # Example usage 
 # ------------------------------------------------------------------------------
-# merged_mouse <- filter_cells(merged_mouse)
+merged_mouse <- filter_cells(merged_mouse)
 # merged_human <- filter_cells(merged_human)
 ```
 
@@ -991,8 +1045,10 @@ Yet, needs to be discussed with Steven.
 # ------------------------------------------------------------------------------
 # Save the filtered merged object
 # ------------------------------------------------------------------------------
-saveRDS(merged_mouse, file = file.path(mouse_save_path, "mouse_merged_filtered.rds"))
+# saveRDS(merged_mouse, file = file.path(mouse_save_path, "mouse_merged_filtered.rds"))
 # saveRDS(merged_human, file = file.path(human_save_path, "human_merged_filtered.rds"))
+
+merged_human = readRDS(file = file.path(human_save_path, "human_merged_filtered.rds"))
 ```
 
 
@@ -1041,7 +1097,7 @@ apply_theme <- function(plot, title) {
 
 ```{r}
 # Load the RDS files
-merged_mouse <- readRDS(file.path(mouse_save_path, "all_samples", "mouse_merged_filtered.rds"))
+# merged_mouse <- readRDS(file.path(mouse_save_path, "all_samples", "mouse_merged_filtered.rds"))
 # merged_human <- readRDS(file.path(human_save_path, "all_samples", "human_merged_filtered.rds"))
 ```
 
@@ -1126,7 +1182,7 @@ process_merged_object <- function(merged_obj) {
 #-------------------------------------------------------------------------------
 # Example Usage
 #-------------------------------------------------------------------------------
-# merged_mouse <- process_merged_object(merged_mouse)
+merged_mouse <- process_merged_object(merged_mouse)
 # merged_human <- process_merged_object(merged_human)
 ```
 
@@ -1281,7 +1337,7 @@ table(merged_mouse@meta.data$orig.ident)
 # ------------------------------------------------------------------------------
 # Save the processed merged objects
 # ------------------------------------------------------------------------------
-saveRDS(merged_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_processed.rds"))
+saveRDS(merged_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_processed_skinnider.rds"))
 # saveRDS(merged_human, file = file.path(human_save_path, "all_samples", "human_processed.rds"))
 ```
 
@@ -1289,7 +1345,7 @@ saveRDS(merged_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_pr
 ## 3.1 Join layers of objects that correspond to same biological sample (CITE-seq samples only)
 ```{r}
 # Load the RDS file
-mouse_doublets <- readRDS(file.path(mouse_save_path,"mouse_doublets.rds"))
+mouse_doublets <- readRDS(file.path(mouse_save_path, "all_samples", "mouse_doublets.rds"))
 ```
 
 Before performing integration, the datasets that comes from the same biological sample (i.e., KNAF3 & KNAF4) needs to be joined.
@@ -1302,9 +1358,9 @@ Before performing integration, the datasets that comes from the same biological 
 knaf3 <- mouse_doublets[["KNAF3_En1Sun1NeuN"]]
 knaf4 <- mouse_doublets[["KNAF4_En1Sun1GFPNeuN_CITEseq"]]
 
-# # 2. Remove these datasets from the samples list
-# mouse_doublets[["KNAF3_En1Sun1NeuN"]] <- NULL
-# mouse_doublets[["KNAF4_En1Sun1GFPNeuN_CITEseq"]] <- NULL
+# 2. Remove these datasets from the samples list
+mouse_doublets[["KNAF3_En1Sun1NeuN"]] <- NULL
+mouse_doublets[["KNAF4_En1Sun1GFPNeuN_CITEseq"]] <- NULL
 
 # 3. Store these datasets in a list
 knaf_list <- list(knaf3, knaf4)
@@ -1314,15 +1370,15 @@ names(knaf_list) <- c("KNAF3_En1Sun1NeuN", "KNAF4_En1Sun1GFPNeuN_CITEseq")
 mouse_doublets <- lapply(mouse_doublets, prepare_seurat_for_merge)
 knaf_list <- lapply(knaf_list, prepare_seurat_for_merge)
 
-# # 5. Merge the objects of each list
-# merged_1 <- merge_all_samples(mouse_doublets)
+# 5. Merge the objects of each list
+merged_1 <- merge_all_samples(mouse_doublets)
 merged_2 <- merge_all_samples(knaf_list)
 
 # 6. Join the layer of merged_2 (i.e., knafo datasets)
-# merged_2[["RNA"]] <- JoinLayers(merged_2[["RNA"]])
+merged_2[["RNA"]] <- JoinLayers(merged_2[["RNA"]])
 
-# # 7. Merge the two merged objects
-# merged_mouse <- merge(x = merged_1, y = merged_2)
+# 7. Merge the two merged objects
+merged_mouse <- merge(x = merged_1, y = merged_2)
 ```
 
 ```{r}
@@ -1350,33 +1406,15 @@ merged_mouse <- subset(merged_mouse, subset = GFP > 0.05 | orig.ident != "KNAF4_
 # 3. Update sample identifiers in metadata
 merged_mouse$orig.ident[merged_mouse$orig.ident %in% c("KNAF3_En1Sun1NeuN", "KNAF4_En1Sun1GFPNeuN_CITEseq")] <- "KNAF3-4_En1Sun1NeuN-GFP"
 ```
+
+
+## 3.2 Integration
+
 ```{r}
-# ------------------------------------------------------------------------------
-# - Perform the filtering and processing steps on the new re-merged object
-# ------------------------------------------------------------------------------
-# 1. Filtering
-merged_2[["percent_mito"]] <- PercentageFeatureSet(merged_2, pattern = "^mt-") 
-merged_2 <- filter_cells(merged_2)
-
-# 2. Processing
-## 2.1 RNA counts
-merged_2 <- process_merged_object(merged_2)
-
-## 2.2 Antibody counts
-merged_2 <- NormalizeADTData(merged_2, assay = "Antibody")
-
-### 2.2.1 Add new column to metadata with GFP-TotalSeqC expression
-gfp_expression_norm <- FetchData(merged_2, vars = "GFP-TotalSeqC", layer = "data")
-merged_2 <- AddMetaData(merged_2, metadata = gfp_expression_norm, col.name = "GFP")
-
-### 2.2.2 Filter cells from CITE-seq sample where GFP < 0.05
-# merged_2<- subset(merged_2, subset = GFP > 0.05 | orig.ident != "KNAF4_En1Sun1GFPNeuN_CITEseq")
-
-# 3. Update sample identifiers in metadata
-# merged_2$orig.ident[merged_2$orig.ident %in% c("KNAF3_En1Sun1NeuN", "KNAF4_En1Sun1GFPNeuN_CITEseq")] <- "KNAF3-4_En1Sun1NeuN-GFP"
+setwd("/shared/projects/cross_species_prof_scn/")
+merged_mouse <- readRDS(file.path(mouse_save_path, "all_samples", "mouse_processed_skinninder.rds"))
 ```
 
-## 3.2 Integration 
 ```{r}
 #-------------------------------------------------------------------------------
 # Function: Perform Anchors-Based RPCA Integration
@@ -1405,119 +1443,13 @@ perform_integration <- function(seurat_obj) {
 #-------------------------------------------------------------------------------
 # Example Usage
 #-------------------------------------------------------------------------------
-# merged_mouse <- perform_integration(merged_mouse)
+merged_mouse <- perform_integration(merged_mouse)
 
 # Load human processed object
 # merged_human <- readRDS(file.path(human_save_path, "all_samples", "human_processed.rds"))
 # merged_human <- perform_integration(merged_human)
 ```
 
-```{r}	
-# Perform SCT
-merged_2 <- SCTransform(merged_2, assay = "RNA", verbose = FALSE)
-```
-
-```{r}
-# Perform PCA
-merged_2 <- RunPCA(merged_2, verbose = FALSE)
-```
-
-```{r}
-# Perform integration
-merged_2 <- perform_integration(merged_2)
-```
-
-```{r}	
-# Save the integrated objects
-saveRDS(merged_2, file = file.path(mouse_save_path, "knaf3-4_integrated.rds"))
-```
-
-```{r}
-# Visualize clustering of Knaf3-4
-DimPlot(merged_2, reduction = "umap.rpca", group.by = "orig.ident", label = TRUE, repel = TRUE)
-```
-```{r}	
-# Compute neighbors using UMAP reduction
-merged_2 <- FindNeighbors(merged_2, reduction = "umap.rpca", dims = 1:2, force.recalc = TRUE)
-
-# Perform clustering
-merged_2 <- FindClusters(merged_2, resolution = 0.5)  # Adjust resolution for finer/coarser clusters
-
-# Inspect the clustering results
-table(Idents(merged_2))  # View the number of cells in each cluster
-
-# Visualize the clustering
-DimPlot(merged_2, reduction = "umap.rpca", label = TRUE, repel = TRUE)
-```	
-
-```{r}	
-# Compute the proportion of Knaf4 cells in each cluster 
-props <- c()
-
-for (cluster in sort(unique(Idents(merged_2)))) {
-  cat("Cluster", cluster, ":", round(100 * sum(merged_2$orig.ident[Idents(merged_2) == cluster] == "KNAF4_En1Sun1GFPNeuN_CITEseq") / sum(Idents(merged_2) == cluster), 2), "%\n")
-  props <- c(props, round(100 * sum(merged_2$orig.ident[Idents(merged_2) == cluster] == "KNAF4_En1Sun1GFPNeuN_CITEseq") / sum(Idents(merged_2) == cluster), 2))
-}
-
-
-```
-# ```{r}
-# # Label the clusters V1 if proportions higher than 90 % 
-# # Label clusters Neuron Only if less than 10% 
-# # Clusters between 10% and 90% are labeld uncertain
-
-# # Define the labels
-# labels <- ifelse(props > 90, "V1", ifelse(props < 10, "Neuron Only", "Uncertain"))
-
-# # Update the cluster names
-# labels <- factor(labels, levels = c("V1", "Uncertain", "Neuron Only"))
-# names(labels) <- levels(Idents(merged_2))
-
-# # Rename the clusters
-
-# merged_2 <- RenameIdents(merged_2, labels)
-
-# table(Idents(merged_2))
-# ```
-
-```{r}
-# Check the overlapping of knaf4 and V1 cells
-knaf4_cells <- which(merged_2$orig.ident == "KNAF4_En1Sun1GFPNeuN_CITEseq")
-v1_cells <- which(Idents(merged_2) == "V1")
-length(intersect(knaf4_cells, v1_cells))
-
-# Check the overlapping of knaf4 and Neuron Only cells
-neuron_only_cells <- which(Idents(merged_2) == "Neuron Only")
-length(intersect(knaf4_cells, neuron_only_cells))
-
-# Check the overlapping of knaf4 adn Uncertain cells
-uncertain_cells <- which(Idents(merged_2) == "Uncertain")
-length(intersect(knaf4_cells, uncertain_cells))
-
-# Check the overlapping of knaf3 and V1 cells
-knaf3_cells <- which(merged_2$orig.ident == "KNAF3_En1Sun1NeuN")
-length(intersect(knaf3_cells, v1_cells))
-
-# Check the overlapping of knaf3 and Neuron Only cells
-length(intersect(knaf3_cells, neuron_only_cells))
-
-# Check the overlapping of knaf3 and Uncertain cells
-length(intersect(knaf3_cells, uncertain_cells))
-
-# Check the overlapping of V1 and Neuron Only cells
-length(intersect(v1_cells, neuron_only_cells))
-
-```
-
-```{r}	
-# Plot the new clusters
-DimPlot(merged_2, reduction = "umap", label = TRUE, repel = TRUE)
-```
-
-```{r}	
-# Save the integrated objects
-saveRDS(merged_2, file = file.path(mouse_save_path, "knaf3-4_V1_labeled.rds"))
-```
 ```{r}
 # UMAP visualization
 # Group by samples
@@ -1574,7 +1506,7 @@ plt
 # ------------------------------------------------------------------------------
 # Save the integrated objects
 # ------------------------------------------------------------------------------
-saveRDS(merged_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_integrated.rds"))
+saveRDS(merged_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_integrated_skinnider .rds"))
 #saveRDS(merged_human, file = file.path(human_save_path, "all_samples", "human_integrated.rds"))
 ```
 
@@ -1582,7 +1514,7 @@ saveRDS(merged_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_in
 ```{r}
 # Load the RDS files
 # merged_mouse <- readRDS(file.path(mouse_save_path, "all_samples", "mouse_integrated.rds"))
-# merged_human <- readRDS(file.path(human_save_path, "all_samples", "human_integrated.rds"))
+merged_human <- readRDS(file.path(human_save_path, "all_samples", "human_integrated.rds"))
 ```
 
 ```{r}
@@ -1774,25 +1706,26 @@ ggsave(filename = file.path(mouse_path_figures, # or human_path_figures
 #' @export
 summarize_celltypes <- function(seurat_object) {
   
-  # Create a table to count the number of cells in each cell type
-  celltype_counts <- table(seurat_object@meta.data$celltype)
-  
-  # Convert the table to a data frame for better visualization
-  celltype_summary <- as.data.frame(celltype_counts)
-  colnames(celltype_summary) <- c("CellType", "Count")
-  
-  # Calculate the percentage of each cell type 
-  total_cells <- sum(celltype_summary$Count)
-  celltype_summary$Percentage <- round((celltype_summary$Count / total_cells) * 100, 2)
-  
-  # Return the summarized data frame
-  return(celltype_summary)
+  for (ori in unique(seurat_object$orig.ident)){
+    # Create a table to count the number of cells in each cell type
+    celltype_counts <- table(subset(seurat_object, subset = orig.ident %in% c(ori))@meta.data$celltype)
+    
+    # Convert the table to a data frame for better visualization
+    celltype_summary <- as.data.frame(celltype_counts)
+    colnames(celltype_summary) <- c("CellType", "Count")
+    
+    # Calculate the percentage of each cell type 
+    total_cells <- sum(celltype_summary$Count)
+    celltype_summary$Percentage <- round((celltype_summary$Count / total_cells) * 100, 2)
+    print(ori)
+    print(celltype_summary)
+  }
 }
 
 #-------------------------------------------------------------------------------
 # Example Usage
 #-------------------------------------------------------------------------------
-#summarize_celltypes(merged_mouse)
+summarize_celltypes(merged_mouse)
 #summarize_celltypes(merged_human)
 ```
 
@@ -1807,8 +1740,8 @@ saveRDS(merged_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_an
 # 5. Mouse V1 classification using CITE-seq samples as reference (positive selection)
 ```{r}
 # Load the RDS files
-merged_mouse <- readRDS(file.path(mouse_save_path, "all_samples", "mouse_annotated.rds"))
-# merged_human <- readRDS(file.path(human_save_path, "all_samples", "human_annotated.rds"))
+# merged_mouse <- readRDS(file.path(mouse_save_path, "all_samples", "mouse_annotated.rds"))
+merged_human <- readRDS(file.path(human_save_path, "all_samples", "human_annotated.rds"))
 ```
 
 ```{r}
@@ -1895,7 +1828,7 @@ table(neurons_mouse@meta.data$orig.ident, neurons_mouse@meta.data$celltype)
 
 ```{r}
 # Save 
-saveRDS(neurons_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_neurons.rds"))
+saveRDS(neurons_mouse, file = file.path(mouse_save_path, "all_samples", "mouse_neurons_skinnider.rds"))
 # saveRDS(neurons_human, file = file.path(human_save_path, "all_samples", "human_neurons.rds"))
 ```
 
