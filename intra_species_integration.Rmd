@@ -57,11 +57,13 @@ options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB fo
 ```{r}
 mouse_neurons <- readRDS("data/origin_data/mouse_neurons.rds")
 mouse_neurons_skinnider <- readRDS("data/origin_data/mouse_neurons_skinnider.rds")
+mouse_neurons_knaf14 <- readRDS("data/origin_data/mouse_processed_knaf14.rds")
 ```
 
 ```{r}	
 neurons_mouse_counts <- GetAssayData(mouse_neurons, layer = "counts")
 neurons_mouse_skinnider_counts <- GetAssayData(mouse_neurons_skinnider, layer = "counts")
+neurons_mouse_knaf14_counts <- GetAssayData(mouse_neurons_knaf14, layer = "counts")
 ```
 
 
@@ -71,6 +73,8 @@ mouse_neurons = CreateSeuratObject(counts = neurons_mouse_counts)
 mouse_neurons$species <- "mouse"
 mouse_neurons_skinnider <- CreateSeuratObject(counts = neurons_mouse_skinnider_counts)
 mouse_neurons_skinnider$species <- "mouse"
+mouse_neurons_knaf14 <- CreateSeuratObject(counts = neurons_mouse_knaf14_counts)
+mouse_neurons_knaf14$species <- "mouse"
 ```
 
 ```{r}	
@@ -79,7 +83,7 @@ mouse_neurons <- subset(x = mouse_neurons, subset = orig.ident %in% c("MATSON", 
 # mouse_neurons <- subset(x = mouse_neurons, subset = orig.ident %in% c("KNAF11", "KNAF10", "KNAF9", "KNAF8", "BOUV6", "BOUV7"))
 ```
 ```{r}
-merged_neurons <- merge(mouse_neurons, mouse_neurons_skinnider)
+merged_neurons <- merge(mouse_neurons, c(mouse_neurons_skinnider, mouse_neurons_knaf14))
 ```
 
 ```{r}
@@ -103,7 +107,7 @@ mouse_neurons <- RunPCA(mouse_neurons)
 
 
 ```{r}
-mouse_neurons <- IntegrateLayers(object = mouse_neurons, method = 'RPCAIntegration', orig.reduction = 'pca', new.reduction = 'rpca', reference = 5, verbose = TRUE)
+mouse_neurons <- IntegrateLayers(object = mouse_neurons, method = 'RPCAIntegration', orig.reduction = 'pca', new.reduction = 'rpca', verbose = TRUE)
 ```
 
 ```{r}
@@ -154,12 +158,12 @@ DimPlot(mouse_neurons, reduction = 'umap.rpca',group.by = "citeseq")
 
 ```{r}
 # Save the integrated dataset as h5
-SaveH5Seurat(mouse_neurons, filename = "mouse_neurons+skinnider.h5Seurat", overwrite = TRUE)
+SaveH5Seurat(mouse_neurons, filename = "mouse_neurons+skinnider+knaf14.h5Seurat", overwrite = TRUE)
 
 ```	
 
 ```{r}
-Convert(source = "mouse_neurons+skinnider.h5Seurat", dest = "mouse_neurons+skinnider.h5ad", overwrite = TRUE)
+Convert(source = "mouse_neurons+skinnider+knaf14.h5Seurat", dest = "mouse_neurons+skinnider+knaf14.h5ad", overwrite = TRUE)
 ```	
 
 ```{r}
