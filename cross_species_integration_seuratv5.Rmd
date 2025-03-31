@@ -53,10 +53,48 @@ set.seed(1234)
 # Increase memory usage
 options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB for global variables in future expressions
 ```
+```{r}
+# Load mouse preprocessed seurat objects to integrate
+mouse_neurons <- readRDS("data/origin_data/mouse_neurons.rds")
+mouse_neurons_skinnider <- readRDS("data/origin_data/mouse_neurons_skinnider.rds")
+mouse_neurons_knaf14 <- readRDS("data/origin_data/mouse_processed_knaf14.rds")
+```
+
+```{r}
+# Extract the raw counts
+neurons_mouse_counts <- GetAssayData(mouse_neurons, layer = "counts")
+neurons_mouse_skinnider_counts <- GetAssayData(mouse_neurons_skinnider, layer = "counts")
+neurons_mouse_knaf14_counts <- GetAssayData(mouse_neurons_knaf14, layer = "counts")
+```
 
 
 ```{r}
-mouse_neurons <- readRDS("data/origin_data/mouse_neurons.rds")
+# Create new seurat objects
+mouse_neurons = CreateSeuratObject(counts = neurons_mouse_counts)
+mouse_neurons$species <- "mouse"
+mouse_neurons_skinnider <- CreateSeuratObject(counts = neurons_mouse_skinnider_counts)
+mouse_neurons_skinnider$species <- "mouse"
+mouse_neurons_knaf14 <- CreateSeuratObject(counts = neurons_mouse_knaf14_counts)
+mouse_neurons_knaf14$species <- "mouse"
+```
+
+```{r}	
+# Drop unwanted layers
+mouse_neurons <- subset(x = mouse_neurons, subset = orig.ident %in% c("MATSON", "KATHE", "KNAF3", "KNAF4", "BOUV5"))
+# mouse_neurons <- subset(x = mouse_neurons, subset = orig.ident %in% c("KNAF11", "KNAF10", "KNAF9", "KNAF8", "BOUV6", "BOUV7"))
+```
+```{r}
+# Merge mouse_neurons
+merged_neurons <- merge(mouse_neurons, c(mouse_neurons_skinnider, mouse_neurons_knaf14))
+```
+
+```{r}
+mouse_neurons <- merged_neurons
+mouse_neurons <- JoinLayers(mouse_neurons[['RNA']])
+```
+
+```{r}
+# Load human preprocessed seurat objects
 human_neurons <- readRDS("data/origin_data/human_neurons.rds")
 human_neurons_KNAF <- readRDS("data/origin_data/human_merged_filtered_KNAF.rds")
 human_neurons_KNAF <- subset(human_neurons_KNAF, subset = orig.ident %in% c("KNAF12_Humain-P11_NeuN_180325"))
@@ -165,9 +203,9 @@ length(missing_human_genes) # 13896
 
 ```{r}
 # Add all human genes that are not present in the mouse gene matrix to the mouse data with 0 counts
-# COncatenate missing gens, common genes to build a basis for co-integration
+# Concatenate missing gens, common genes to build a basis for co-integration
 gene_basis <- c(common_genes, missing_mouse_genes, missing_human_genes)
-length(gene_basis) # 13547 34645
+length(gene_basis)
 ```
 
 ```{r}
@@ -191,12 +229,6 @@ neurons_mouse_counts <- rbind(neurons_mouse_counts, matrix(0, nrow = length(miss
 # Update rownames
 rownames(neurons_mouse_counts)[(nrow(neurons_mouse_counts) - length(missing_human_genes) + 1):nrow(neurons_mouse_counts)] <- missing_human_genes
 ```
-
-```{r}
-# neurons_mouse_counts <- neurons_mouse_counts[rownames(neurons_mouse_counts) %in% gene_basis, ]
-# neurons_human_counts <- neurons_human_counts[rownames(neurons_human_counts) %in% gene_basis, ] 
-```
-
 ```{r}
 # Merge mouse and human datasets
 mouse_neurons = CreateSeuratObject(counts = neurons_mouse_counts)
@@ -207,23 +239,27 @@ human_neurons$species <- "human"
 human_neurons_KNAF$species <- "human"
 ```
 
-```{r}	
+```{r}
 cross_species <- merge(mouse_neurons, y = c(human_neurons, human_neurons_KNAF))
 ```
 
-```{r}	
-cross_species <- subset(x = cross_species, subset = orig.ident %in% c("YADAV", "ZHANG", "KNAF11", "KNAF10", "KNAF9", "KNAF8", "KNAF3", "KNAF4", "KNAF12_Humain-P11_NeuN_180325"))
+```{r}
+# Drop unwanted layers
+cross_species <- subset(x = cross_species, subset = orig.ident %in% c("YADAV", "ZHANG", "KNAF11", "KNAF10", "KNAF9", "KNAF8", "KNAF3", "KNAF4", "KNAF12_Humain-P11_NeuN_180325","MATSON", "KATHE", "GSE7474501", "GSM7474503", "KNAF14", "BOUV5"))
 ```
 
 ```{r}
+# Join all counts
 cross_species[['RNA']] <- JoinLayers(object = cross_species[['RNA']])
 ```
 
 ```{r}
+# Split layers using orig.ident
 cross_species <- split(cross_species, f = cross_species$orig.ident)
 ```
 
 ```{r}
+# Normalise data and find variable features + Run Principal Coomponent analysis
 cross_species <- NormalizeData(cross_species)
 cross_species <- FindVariableFeatures(cross_species)
 cross_species <- ScaleData(cross_species)
@@ -231,10 +267,12 @@ cross_species <- RunPCA(cross_species)
 ```
 
 ```{r}
+# Integrate layers from different species using RPCA
 cross_species <- IntegrateLayers(object = cross_species, method = 'RPCAIntegration', orig.reduction = 'pca', new.reduction = 'rpca', verbose = TRUE, k.weight = 80)
 ```
 
 ```{r}
+# Compute a umap representation
 cross_species <- FindNeighbors(cross_species, reduction = 'rpca', dims = 1:30)
 cross_species <- FindClusters(cross_species, resolution = 2, cluster_names = 'rpca_clusters')
 
@@ -270,10 +308,11 @@ cross_species$training_labels[cross_species$orig.ident == "KNAF3"] <- 0
 
 ```{r}
 # Save the integrated dataset as h5
-SaveH5Seurat(cross_species, filename = "data/co_integrated_data/cross_species_human_augmented+KNAF12.h5Seurat", overwrite = TRUE)
+SaveH5Seurat(cross_species, filename = "data/co_integrated_data/cross_species_all_sets.h5Seurat", overwrite = TRUE)
 
 ```	
 
 ```{r}
-Convert(source = "data/co_integrated_data/cross_species_human_augmented+KNAF12.h5Seurat", dest = "data/co_integrated_data/cross_species_human_augmented+KNAF12.h5ad", overwrite = TRUE)
+# Convert to h5ad object (usable in scanpy)
+Convert(source = "data/co_integrated_data/cross_species_all_sets.h5Seurat", dest = "data/co_integrated_data/cross_species_all_sets.h5ad", overwrite = TRUE)
 ```	

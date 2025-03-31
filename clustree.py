@@ -3,6 +3,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 def clustree(clusterings : list, ax):
+    """ Compute and plot a tree to compare and link a list of clusters.
+    
+        Args:
+            - clusterings: List of clusterings in the form of a list of arrays(n) of integers each standing for a cluster
+        
+        Outs:
+            - G, pos: nx.Graph G and computed positions of nodes and edges"""
     graph_layers = []
     graph_edges_between_layers = []
 

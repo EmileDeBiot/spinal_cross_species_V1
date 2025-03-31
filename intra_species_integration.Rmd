@@ -55,6 +55,7 @@ options(future.globals.maxSize=20000*1024^2)  # allocates approximately 20GiB fo
 ```
 
 ```{r}
+# Load mouse preprocessed seurat object to integrate
 mouse_neurons <- readRDS("data/origin_data/mouse_neurons.rds")
 mouse_neurons_skinnider <- readRDS("data/origin_data/mouse_neurons_skinnider.rds")
 mouse_neurons_knaf14 <- readRDS("data/origin_data/mouse_processed_knaf14.rds")
