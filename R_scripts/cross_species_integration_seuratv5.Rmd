@@ -89,6 +89,13 @@ merged_neurons <- merge(mouse_neurons, c(mouse_neurons_skinnider, mouse_neurons_
 ```
 
 ```{r}
+mouse_neurons_knaf14 <- NULL
+mouse_neurons_skinnider <- NULL
+neurons_mouse_counts <- NULL
+neurons_mouse_skinnider_counts <- NULL
+neurons_mouse_knaf14_counts <- NULL
+```
+```{r}
 mouse_neurons <- merged_neurons
 mouse_neurons <- JoinLayers(mouse_neurons[['RNA']])
 ```
@@ -96,10 +103,14 @@ mouse_neurons <- JoinLayers(mouse_neurons[['RNA']])
 ```{r}
 # Load human preprocessed seurat objects
 human_neurons <- readRDS("data/origin_data/human_neurons.rds")
-human_neurons_KNAF <- readRDS("data/origin_data/human_merged_filtered_KNAF.rds")
-human_neurons_KNAF <- subset(human_neurons_KNAF, subset = orig.ident %in% c("KNAF12_Humain-P11_NeuN_180325"))
-human_neurons_KNAF <- JoinLayers(human_neurons_KNAF)
-human_neurons <- merge(human_neurons, human_neurons_KNAF)
+human_neurons_KNAF12 <- readRDS("data/origin_data/human_merged_filtered_KNAF.rds")
+human_neurons_KNAF12 <- subset(human_neurons_KNAF12, subset = orig.ident %in% c("KNAF12_Humain-P11_NeuN_180325"))
+human_neurons_KNAF12 <- JoinLayers(human_neurons_KNAF12)
+human_neurons_KNAF1415 <- readRDS("data/origin_data/human_knaf1415_merged_filtered.rds")
+human_neurons_KNAF1415 <- JoinLayers(human_neurons_KNAF1415)
+human_neurons_KNAF89 <- readRDS("data/origin_data/human_knaf89_merged_filtered.rds")
+human_neurons_KNAF89 <- JoinLayers(human_neurons_KNAF89)
+human_neurons <- merge(human_neurons, c(human_neurons_KNAF12, human_neurons_KNAF1415, human_neurons_KNAF89))
 ```
 
 ```{r}	
@@ -177,12 +188,16 @@ dim(neurons_mouse_counts)  # 20,749 genes, 18,102 neurons
 #------------------------------------------------------------------------------- 
 # Retrieve the raw counts matrix of human neurons
 neurons_human_counts <- GetAssayData(human_neurons, layer = "counts")
-neurons_human_KNAF_counts <- GetAssayData(human_neurons_KNAF, layer = "counts")
+neurons_human_KNAF_counts <- GetAssayData(human_neurons_KNAF12, layer = "counts")
+neurons_human_knaf1415_counts <- GetAssayData(human_neurons_KNAF1415, layer = "counts")
+neurons_human_knaf89_counts <- GetAssayData(human_neurons_KNAF89, layer = "counts")
 ```
 
 ```{r}
 dim(neurons_human_counts) # 27,443 genes, 18,927 neurons
 dim(neurons_human_KNAF_counts)
+dim(neurons_human_knaf1415_counts)
+dim(neurons_human_knaf89_counts)
 #-------------------------------------------------------------------------------
 # 6. Identify common genes between mouse and human count matrices
 #-------------------------------------------------------------------------------
@@ -202,50 +217,69 @@ length(missing_human_genes) # 13896
 ```
 
 ```{r}
-# Add all human genes that are not present in the mouse gene matrix to the mouse data with 0 counts
-# Concatenate missing gens, common genes to build a basis for co-integration
-gene_basis <- c(common_genes, missing_mouse_genes, missing_human_genes)
-length(gene_basis)
+neurons_mouse_counts <- neurons_mouse_counts[common_genes, ]
+neurons_human_counts <- neurons_human_counts[common_genes, ]
+neurons_human_KNAF_counts <- neurons_human_KNAF_counts[common_genes, ]
+neurons_human_knaf1415_counts <- neurons_human_knaf1415_counts[common_genes, ]
+neurons_human_knaf89_counts <- neurons_human_knaf89_counts[common_genes, ]
 ```
 
-```{r}
-# # Add missing rows to the human dataset 
-neurons_human_counts <- rbind(neurons_human_counts, matrix(0, nrow = length(missing_mouse_genes), ncol = ncol(neurons_human_counts)))
-neurons_human_KNAF_counts <- rbind(neurons_human_KNAF_counts, matrix(0, nrow = length(missing_mouse_genes), ncol = ncol(neurons_human_KNAF_counts)))
-dim(neurons_human_counts)
-dim(neurons_human_KNAF_counts)
-```
+# ```{r}
+# # Add all human genes that are not present in the mouse gene matrix to the mouse data with 0 counts
+# # Concatenate missing gens, common genes to build a basis for co-integration
+# gene_basis <- c(common_genes, missing_mouse_genes, missing_human_genes)
+# length(gene_basis)
+# ```
 
-```{r}
-# # Update rownames 
-rownames(neurons_human_counts)[(nrow(neurons_human_counts) - length(missing_mouse_genes) + 1):nrow(neurons_human_counts)] <- missing_mouse_genes
-rownames(neurons_human_KNAF_counts)[(nrow(neurons_human_KNAF_counts) - length(missing_mouse_genes) + 1):nrow(neurons_human_KNAF_counts)] <- missing_mouse_genes
-```
+# ```{r}
+# # # Add missing rows to the human dataset 
+# neurons_human_counts <- rbind(neurons_human_counts, matrix(0, nrow = length(missing_mouse_genes), ncol = ncol(neurons_human_counts)))
+# neurons_human_KNAF_counts <- rbind(neurons_human_KNAF_counts, matrix(0, nrow = length(missing_mouse_genes), ncol = ncol(neurons_human_KNAF_counts)))
+# dim(neurons_human_counts)
+# dim(neurons_human_KNAF_counts)
+# ```
 
-```{r}
-# Add missing rows to the mouse dataset
-neurons_mouse_counts <- rbind(neurons_mouse_counts, matrix(0, nrow = length(missing_human_genes), ncol = ncol(neurons_mouse_counts)))
+# ```{r}
+# # # Update rownames 
+# rownames(neurons_human_counts)[(nrow(neurons_human_counts) - length(missing_mouse_genes) + 1):nrow(neurons_human_counts)] <- missing_mouse_genes
+# rownames(neurons_human_KNAF_counts)[(nrow(neurons_human_KNAF_counts) - length(missing_mouse_genes) + 1):nrow(neurons_human_KNAF_counts)] <- missing_mouse_genes
+# ```
 
-# Update rownames
-rownames(neurons_mouse_counts)[(nrow(neurons_mouse_counts) - length(missing_human_genes) + 1):nrow(neurons_mouse_counts)] <- missing_human_genes
-```
+# ```{r}
+# # Add missing rows to the mouse dataset
+# neurons_mouse_counts <- rbind(neurons_mouse_counts, matrix(0, nrow = length(missing_human_genes), ncol = ncol(neurons_mouse_counts)))
+
+# # Update rownames
+# rownames(neurons_mouse_counts)[(nrow(neurons_mouse_counts) - length(missing_human_genes) + 1):nrow(neurons_mouse_counts)] <- missing_human_genes
+# ```
+
 ```{r}
 # Merge mouse and human datasets
 mouse_neurons = CreateSeuratObject(counts = neurons_mouse_counts)
 human_neurons = CreateSeuratObject(counts = neurons_human_counts)
-human_neurons_KNAF = CreateSeuratObject(counts = neurons_human_KNAF_counts)
+human_neurons_KNAF12 = CreateSeuratObject(counts = neurons_human_KNAF_counts)
+human_neurons_knaf1415 = CreateSeuratObject(counts = neurons_human_knaf1415_counts)
+human_neurons_knaf89 = CreateSeuratObject(counts = neurons_human_knaf89_counts)
 mouse_neurons$species <- "mouse"
 human_neurons$species <- "human"
-human_neurons_KNAF$species <- "human"
+human_neurons_KNAF12$species <- "human"
+human_neurons_KNAF1415$species <- "human"
+human_neurons_KNAF89$species <- "human"
 ```
 
 ```{r}
-cross_species <- merge(mouse_neurons, y = c(human_neurons, human_neurons_KNAF))
+cross_species <- merge(mouse_neurons, y = c(human_neurons, human_neurons_KNAF12, human_neurons_KNAF1415, human_neurons_KNAF89), by = common_genes)
 ```
-
+```{r}
+mouse_neurons <- NULL
+human_neurons <- NULL
+human_neurons_KNAF12 <- NULL
+human_neurons_KNAF1415 <- NULL
+human_neurons_KNAF89 <- NULL
+```
 ```{r}
 # Drop unwanted layers
-cross_species <- subset(x = cross_species, subset = orig.ident %in% c("YADAV", "ZHANG", "KNAF11", "KNAF10", "KNAF9", "KNAF8", "KNAF3", "KNAF4", "KNAF12_Humain-P11_NeuN_180325","MATSON", "KATHE", "GSE7474501", "GSM7474503", "KNAF14", "BOUV5"))
+cross_species <- subset(x = cross_species, subset = orig.ident %in% c("YADAV", "ZHANG", "KNAF11", "KNAF10", "KNAF9_Humain-P13_NeuN_021024", "KNAF8_Humain-P12_NeuN_021024", "KNAF3", "KNAF4", "KNAF12","MATSON", "KATHE", "GSE7474501", "GSM7474503", "KNAF14", "BOUV5", "KNAF14_Humain-P15_NeuN_a_280325", "KNAF15_Humain-P15_NeuN_b_280325"))
 ```
 
 ```{r}
@@ -308,11 +342,11 @@ cross_species$training_labels[cross_species$orig.ident == "KNAF3"] <- 0
 
 ```{r}
 # Save the integrated dataset as h5
-SaveH5Seurat(cross_species, filename = "data/co_integrated_data/cross_species_all_sets.h5Seurat", overwrite = TRUE)
+SaveH5Seurat(cross_species, filename = "data/co_integrated_data/cross_species_all_sets_common_genes.h5Seurat", overwrite = TRUE)
 
 ```	
 
 ```{r}
 # Convert to h5ad object (usable in scanpy)
-Convert(source = "data/co_integrated_data/cross_species_all_sets.h5Seurat", dest = "data/co_integrated_data/cross_species_all_sets.h5ad", overwrite = TRUE)
+Convert(source = "data/co_integrated_data/cross_species_all_sets_common_genes.h5Seurat", dest = "data/co_integrated_data/cross_species_all_sets_common_genes.h5ad", overwrite = TRUE)
 ```	

@@ -11,3 +11,4 @@ one2one_orthologs.csv
 .ipynb_checkpoints
 converting.Rmd
 /__pycache__
+/python_data_analysis/figures
