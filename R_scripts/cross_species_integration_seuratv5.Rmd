@@ -101,6 +101,10 @@ mouse_neurons <- JoinLayers(mouse_neurons[['RNA']])
 ```
 
 ```{r}
+merged_neurons <- NULL
+```
+
+```{r}
 # Load human preprocessed seurat objects
 human_neurons <- readRDS("data/origin_data/human_neurons.rds")
 human_neurons_KNAF12 <- readRDS("data/origin_data/human_merged_filtered_KNAF.rds")
@@ -110,7 +114,10 @@ human_neurons_KNAF1415 <- readRDS("data/origin_data/human_knaf1415_merged_filter
 human_neurons_KNAF1415 <- JoinLayers(human_neurons_KNAF1415)
 human_neurons_KNAF89 <- readRDS("data/origin_data/human_knaf89_merged_filtered.rds")
 human_neurons_KNAF89 <- JoinLayers(human_neurons_KNAF89)
-human_neurons <- merge(human_neurons, c(human_neurons_KNAF12, human_neurons_KNAF1415, human_neurons_KNAF89))
+human_neurons_KNAF1617 <- readRDS("data/origin_data/human_knaf1617_merged_filtered.rds")
+human_neurons_KNAF1617 <- JoinLayers(human_neurons_KNAF1617)
+human_neurons <- merge(human_neurons, c(human_neurons_KNAF12, human_neurons_KNAF1415, human_neurons_KNAF89, human_neurons_KNAF1617))
+
 ```
 
 ```{r}	
@@ -191,6 +198,7 @@ neurons_human_counts <- GetAssayData(human_neurons, layer = "counts")
 neurons_human_KNAF_counts <- GetAssayData(human_neurons_KNAF12, layer = "counts")
 neurons_human_knaf1415_counts <- GetAssayData(human_neurons_KNAF1415, layer = "counts")
 neurons_human_knaf89_counts <- GetAssayData(human_neurons_KNAF89, layer = "counts")
+neurons_human_knaf1617_counts <- GetAssayData(human_neurons_KNAF1617, layer = "counts")
 ```
 
 ```{r}
@@ -198,6 +206,7 @@ dim(neurons_human_counts) # 27,443 genes, 18,927 neurons
 dim(neurons_human_KNAF_counts)
 dim(neurons_human_knaf1415_counts)
 dim(neurons_human_knaf89_counts)
+dim(neurons_human_knaf1617_counts)
 #-------------------------------------------------------------------------------
 # 6. Identify common genes between mouse and human count matrices
 #-------------------------------------------------------------------------------
@@ -222,6 +231,7 @@ neurons_human_counts <- neurons_human_counts[common_genes, ]
 neurons_human_KNAF_counts <- neurons_human_KNAF_counts[common_genes, ]
 neurons_human_knaf1415_counts <- neurons_human_knaf1415_counts[common_genes, ]
 neurons_human_knaf89_counts <- neurons_human_knaf89_counts[common_genes, ]
+neurons_human_knaf1617_counts <- neurons_human_knaf1617_counts[common_genes, ]
 ```
 
 # ```{r}
@@ -258,17 +268,19 @@ neurons_human_knaf89_counts <- neurons_human_knaf89_counts[common_genes, ]
 mouse_neurons = CreateSeuratObject(counts = neurons_mouse_counts)
 human_neurons = CreateSeuratObject(counts = neurons_human_counts)
 human_neurons_KNAF12 = CreateSeuratObject(counts = neurons_human_KNAF_counts)
-human_neurons_knaf1415 = CreateSeuratObject(counts = neurons_human_knaf1415_counts)
-human_neurons_knaf89 = CreateSeuratObject(counts = neurons_human_knaf89_counts)
+human_neurons_KNAF1415 = CreateSeuratObject(counts = neurons_human_knaf1415_counts)
+human_neurons_KNAF89 = CreateSeuratObject(counts = neurons_human_knaf89_counts)
+human_neurons_KNAF1617 = CreateSeuratObject(counts = neurons_human_knaf1617_counts)
 mouse_neurons$species <- "mouse"
 human_neurons$species <- "human"
 human_neurons_KNAF12$species <- "human"
 human_neurons_KNAF1415$species <- "human"
 human_neurons_KNAF89$species <- "human"
+human_neurons_KNAF1617$species <- "human"
 ```
 
 ```{r}
-cross_species <- merge(mouse_neurons, y = c(human_neurons, human_neurons_KNAF12, human_neurons_KNAF1415, human_neurons_KNAF89), by = common_genes)
+cross_species <- merge(mouse_neurons, y = c(human_neurons, human_neurons_KNAF12, human_neurons_KNAF1415, human_neurons_KNAF89, human_neurons_KNAF1617), by = common_genes)
 ```
 ```{r}
 mouse_neurons <- NULL
@@ -276,10 +288,11 @@ human_neurons <- NULL
 human_neurons_KNAF12 <- NULL
 human_neurons_KNAF1415 <- NULL
 human_neurons_KNAF89 <- NULL
+human_neurons_KNAF1617 <- NULL
 ```
 ```{r}
 # Drop unwanted layers
-cross_species <- subset(x = cross_species, subset = orig.ident %in% c("YADAV", "ZHANG", "KNAF11", "KNAF10", "KNAF9_Humain-P13_NeuN_021024", "KNAF8_Humain-P12_NeuN_021024", "KNAF3", "KNAF4", "KNAF12","MATSON", "KATHE", "GSE7474501", "GSM7474503", "KNAF14", "BOUV5", "KNAF14_Humain-P15_NeuN_a_280325", "KNAF15_Humain-P15_NeuN_b_280325"))
+cross_species <- subset(x = cross_species, subset = orig.ident %in% c("YADAV", "ZHANG", "KNAF11", "KNAF10", "KNAF9", "KNAF8 ", "KNAF3", "KNAF4", "KNAF12","MATSON", "KATHE", "GSE7474501", "GSM7474503", "KNAF14", "BOUV5", "KNAF14_Humain-P15_NeuN_a_280325", "KNAF15_Humain-P15_NeuN_b_280325", 'KNAF16', 'KNAF17', 'KNAF15'))
 ```
 
 ```{r}
