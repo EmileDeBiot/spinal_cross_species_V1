@@ -5,17 +5,17 @@ Spinal interneurons' role in motor processes is essential and multiple eletrophy
 This analysis uses cross-species transcriptomics to characterize human spinal V1 interneurons. 
 
 
-## DL fastq on terminal
+## Download fastq on terminal on the cluster
 download: wget command + link
 extract: tar -xvf filename
 
 ## Compute count matrices
-change the names of the files: folder in folder with the same name + all files from the same sample (see example on the cluster)
-use cell ranger with slurm job: got to jobs, select count_matrix, change the folder name in the script
+Change the names of the files: folder in folder with the same name + all files from the same sample (see example on the cluster)
+Use cell ranger with slurm job: got to jobs, select count_matrix, change the folder name in the script
 (if you want to run only one script for multiple samples, you can set up your directories to use the script in that way, you can also run multiple scripts to run in parallel)
 
 ## Preprocessing 
-start an interactive R session: adjust RAM depending on what you want to do
+Start an interactive R session: adjust RAM depending on what you want to do
 Modify the script to preprocess only the new datasets
 
 ## Co-integration
